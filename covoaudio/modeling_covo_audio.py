@@ -306,7 +306,7 @@ class CovoAudioForCausalLM(PreTrainedModel, GenerationMixin):
             wav = resampler16k(wav)
             audio = pad_or_trim(wav)
             # [B, 80, 3000] 30s 100hz
-            mel_features = log_mel_spectrogram(audio, n_mels=128).to(torch.bfloat16)
+            mel_features = log_mel_spectrogram(audio, n_mels=80).to(torch.bfloat16)   
             mel_features_list.append(mel_features)
         mel_features = torch.stack(mel_features_list)
 
@@ -362,7 +362,7 @@ class CovoAudioForCausalLM(PreTrainedModel, GenerationMixin):
         
         if is_first_iteration:      # First generation step, include audio processing
             inputs_embeds = self.llm.get_input_embeddings()(input_ids)
-            cAUDIO_id = 151666    # tokenizer.convert_tokens_to_ids("<|cAUDIO|>")
+            cAUDIO_id = kwargs.get(\"cAUDIO_id\", self.config.audio_token_index) 
             audio_features = self.audio_encoder(wavs, inputs_embeds.device)
             feature_lengths = (input_ids == cAUDIO_id).sum(1)
             feature_seq_mask = sequence_mask(feature_lengths, max_len=audio_features.size(1), dtype=torch.bool)

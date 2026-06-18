@@ -1,11 +1,24 @@
 """
 CovoAudioConfig — Qwen2.5-3B-Instruct + Whisper-Small backbone.
 
-Key design decisions:
-  - LLM: Qwen2 (qwen2) via transformers >= 4.37
-  - Encoder: Whisper Small (80-mel, d_model=768)
-  - audio_token_index matches Qwen2.5's vocab boundary (151936)
-  - adapter_downsample=8 → 8× temporal compression of Whisper frames
+Design notes
+────────────
+• LLM   : Qwen2 (transformers >= 4.37, Qwen2Config / Qwen2ForCausalLM)
+• Encoder: Whisper Small  (80-mel, d_model=768)
+• audio_token_index = 151936  — first slot past the standard Qwen2.5 vocab
+• adapter_downsample = 8      — 4 × DownsampleLayer(stride=2) → 16× temporal
+                                compression of 100-Hz Whisper frames
+• alignment_loss_weight       — λ for the cosine-embedding alignment term
+                                added on top of the cross-entropy ASR loss.
+                                Set to 0.0 to disable; 0.1 is a safe default.
+
+n_mels note
+───────────
+The WhisperConfig below uses num_mel_bins=80 (Whisper Small pretrained weights).
+However modeling_covo_audio.py calls log_mel_spectrogram(..., n_mels=128).
+These must agree or the conv1 weights will be mismatched when loading a
+pretrained encoder.  The fix is applied in modeling_covo_audio.py (change to
+n_mels=80) AND here num_mel_bins=80 is kept as the canonical value.
 """
 from typing import Optional
 from transformers import WhisperConfig, PretrainedConfig
@@ -27,13 +40,10 @@ class CovoAudioConfig(PretrainedConfig):
 
     def __init__(
         self,
-        llm_config:         Optional[LLMConfig]     = None,
-        encoder_config:     Optional[WhisperConfig]  = None,
-        audio_token_index:  int   = 151936,   # first token after Qwen2.5 base vocab
-        adapter_downsample: int   = 8,
-        # ── Alignment loss hyperparams ───────────────────────────────────────
-        # Weight for the cosine-embedding alignment loss term.
-        # Set to 0.0 to disable; 0.1 is a safe starting point.
+        llm_config:            Optional[LLMConfig]    = None,
+        encoder_config:        Optional[WhisperConfig] = None,
+        audio_token_index:     int   = 151936,
+        adapter_downsample:    int   = 8,
         alignment_loss_weight: float = 0.1,
         **kwargs,
     ):
@@ -43,16 +53,14 @@ class CovoAudioConfig(PretrainedConfig):
                 architectures=["Qwen2ForCausalLM"],
                 model_type="qwen2",
 
-                # Vocabulary — standard Qwen2.5-3B-Instruct
                 vocab_size=151936,
 
-                # Architecture
                 hidden_size=2048,
                 intermediate_size=11008,
                 num_hidden_layers=36,
                 num_attention_heads=16,
                 num_key_value_heads=2,
-                head_dim=128,           # hidden_size // num_attention_heads
+                head_dim=128,
 
                 hidden_act="silu",
 
@@ -64,10 +72,12 @@ class CovoAudioConfig(PretrainedConfig):
                 rms_norm_eps=1e-6,
                 initializer_range=0.02,
 
-                # Qwen2.5-3B-Instruct special tokens
-                # <|endoftext|>=151643  <|im_start|>=151644  <|im_end|>=151645
+                # Qwen2.5 special tokens:
+                #   <|endoftext|>  = 151643
+                #   <|im_start|>   = 151644
+                #   <|im_end|>     = 151645  ← chat EOS
                 bos_token_id=151643,
-                eos_token_id=151645,   # <|im_end|> used as EOS in ChatML
+                eos_token_id=151645,
                 pad_token_id=151643,
 
                 use_cache=True,
@@ -84,22 +94,21 @@ class CovoAudioConfig(PretrainedConfig):
 
                 vocab_size=51865,
 
-                # 80 mel bins — DO NOT change to 128 (that is Large-V3 only)
+                # 80 mel bins — Whisper Small pretrained weights.
+                # modeling_covo_audio.py must also use n_mels=80 here.
+                # DO NOT change to 128 (Large-V3 only).
                 num_mel_bins=80,
 
-                # Encoder — Whisper Small
                 d_model=768,
                 encoder_layers=12,
                 encoder_attention_heads=12,
                 encoder_ffn_dim=3072,
 
-                # Decoder kept for config validity; not used during training
                 decoder_layers=12,
                 decoder_attention_heads=12,
                 decoder_ffn_dim=3072,
 
                 activation_function="gelu",
-
                 dropout=0.0,
                 attention_dropout=0.0,
                 activation_dropout=0.0,
@@ -141,9 +150,9 @@ class CovoAudioConfig(PretrainedConfig):
         self.llm_config            = llm_config
         self.encoder_config        = encoder_config
 
-        # Derived: adapter output must match LLM hidden size
-        self.whisper_feats_dim = encoder_config.d_model    # 768  (Whisper Small)
-        self.llm_hidden_size   = llm_config.hidden_size    # 2048 (Qwen2.5-3B)
+        # Derived dimensions — used by the trainer and the adapter
+        self.whisper_feats_dim = encoder_config.d_model      # 768
+        self.llm_hidden_size   = llm_config.hidden_size      # 2048
 
         if "dtype" not in kwargs:
             kwargs["dtype"] = "bfloat16"
@@ -151,7 +160,7 @@ class CovoAudioConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
-    # ── Convenience properties ─────────────────────────────────────────────────
+    # ── Convenience properties ────────────────────────────────────────────────
 
     @property
     def num_hidden_layers(self) -> int:
@@ -161,7 +170,7 @@ class CovoAudioConfig(PretrainedConfig):
     def hidden_size(self) -> int:
         return self.llm_config.hidden_size          # 2048
 
-    # ── Serialization ──────────────────────────────────────────────────────────
+    # ── Serialization ─────────────────────────────────────────────────────────
 
     def to_dict(self):
         output = super().to_dict()
