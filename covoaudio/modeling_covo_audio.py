@@ -2,11 +2,11 @@ import torch
 import torchaudio
 from transformers.modeling_utils import PreTrainedModel
 from transformers.generation.utils import GenerationMixin
-from transformers import Gemma3ForCausalLM
+from transformers.models.qwen2 import Qwen2ForCausalLM
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
 from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 
-from configuration_covo_audio import CovoAudioConfig
+from .configuration_covo_audio import CovoAudioConfig
 
 from torch import nn
 import numpy as np
@@ -45,27 +45,19 @@ def get_dialog_prompt(audio, tokenizer, device, first_round=True):
     
     # first round dialog
     if first_round:
-        sys_prompt = """You are "Covo", and your English name is "Covo", an AI assistant developed by Tencent.
-1. Please chat with the user using concise, conversational language. Your attitude should be positive, patient, and like a trustworthy friend.
-2. Do not use lists or numbering. Avoid outputting URLs, emojis, or complex formulas.
-3. Do not criticize competitors or express subjective political opinions. For user questions related to sexual content, politics, terrorism, discrimination, or violence, respond appropriately by handling potential safety risks carefully, while offering humor, emotional comfort, and safe guidance.
-Please converse using both text and audio, alternating between generating 5 text tokens and 15 audio tokens. Use the speaker voice: default_female for the audio part."""
+        sys_prompt = """你是"小腾"，英文名是"Covo"，由腾讯开发的AI助手。
+1、请使用简洁、口语化的语言和用户聊天，你的态度积极、耐心，像一位值得信赖的朋友。
+2、不要使用列表或编号，避免输出网址、表情符号和复杂的公式。
+3、不评价竞争对手，不发表主观政治观点，针对色情类、政治类、恐怖类、歧视类、暴力类的用户问题，你要妥善应对潜在的安全风险，并给出幽默，情绪安抚以及安全的劝导。
+请用文本和音频进行对话，交替生成5个文本token和15个音频token，音频部分使用发音人：default_female"""
         interleave_text = "<|begofcAUDIO|>" + "<|cAUDIO|>" * num_token + "<|endofcAUDIO|>"
         
         sys_prompt = "<|im_start|>system\n" + sys_prompt + "<|im_end|>\n"
-        prompt = (
-        "<bos>"
-        "<start_of_turn>system\n" + sys_prompt + "<end_of_turn>\n"
-        "<start_of_turn>user\n"   + interleave_text + "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-    )
+        prompt = sys_prompt + "<|im_start|>user\n" + interleave_text + "<|im_end|>\n<|im_start|>assistant\n"
     # multi-round dialog
     else:
         interleave_text = "<|begofcAUDIO|>" + "<|cAUDIO|>" * num_token + "<|endofcAUDIO|>"
-        prompt = (
-        "<start_of_turn>user\n" + interleave_text + "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-    )
+        prompt = "\n<|im_start|>user\n" + interleave_text + "<|im_end|>\n<|im_start|>assistant\n"
 
     
     text_inputs = tokenizer(prompt, padding=True, return_tensors="pt").to(device)
@@ -289,7 +281,7 @@ class CovoAudioForCausalLM(PreTrainedModel, GenerationMixin):
     
     def __init__(self, config: CovoAudioConfig, **kwargs):
         super().__init__(config, **kwargs)
-        self.llm = Gemma3ForCausalLM(config.llm_config)
+        self.llm = Qwen2ForCausalLM(config.llm_config)
         self.encoder = WhisperEncoder(config.encoder_config)
         self.audio_adapter = AudioAdapter(config.whisper_feats_dim, 
                                           config.llm_config.hidden_size, 
@@ -314,7 +306,7 @@ class CovoAudioForCausalLM(PreTrainedModel, GenerationMixin):
             wav = resampler16k(wav)
             audio = pad_or_trim(wav)
             # [B, 80, 3000] 30s 100hz
-            mel_features = log_mel_spectrogram(audio, n_mels=self.config.encoder_config.num_mel_bins).to(torch.bfloat16)
+            mel_features = log_mel_spectrogram(audio, n_mels=128).to(torch.bfloat16)
             mel_features_list.append(mel_features)
         mel_features = torch.stack(mel_features_list)
 
@@ -370,7 +362,7 @@ class CovoAudioForCausalLM(PreTrainedModel, GenerationMixin):
         
         if is_first_iteration:      # First generation step, include audio processing
             inputs_embeds = self.llm.get_input_embeddings()(input_ids)
-            cAUDIO_id = self.config.audio_token_index
+            cAUDIO_id = 151666    # tokenizer.convert_tokens_to_ids("<|cAUDIO|>")
             audio_features = self.audio_encoder(wavs, inputs_embeds.device)
             feature_lengths = (input_ids == cAUDIO_id).sum(1)
             feature_seq_mask = sequence_mask(feature_lengths, max_len=audio_features.size(1), dtype=torch.bool)
@@ -396,7 +388,19 @@ class CovoAudioForCausalLM(PreTrainedModel, GenerationMixin):
             }
     
     def _set_gradient_checkpointing(self, module, value=False):
-        if value:
-            self.llm.gradient_checkpointing_enable()
-        else:
-            self.llm.gradient_checkpointing_disable()
+        # For Qwen2
+        if hasattr(self.llm, 'gradient_checkpointing'):
+            self.llm.gradient_checkpointing = value
+
+            # Add the missing _gradient_checkpointing_func method to Qwen2Model
+            if value and not hasattr(self.llm, '_gradient_checkpointing_func'):
+                def _gradient_checkpointing_func(module_to_run, *args, **kwargs):
+                    return torch.utils.checkpoint.checkpoint(module_to_run, *args, **kwargs)
+
+                self.llm._gradient_checkpointing_func = _gradient_checkpointing_func
+
+        # For custom encoder and adapter
+        if hasattr(self.encoder, 'gradient_checkpointing'):
+            self.encoder.gradient_checkpointing = value
+        if hasattr(self.audio_adapter, 'gradient_checkpointing'):
+            self.audio_adapter.gradient_checkpointing = value

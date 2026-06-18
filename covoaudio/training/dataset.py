@@ -1,70 +1,93 @@
 """
-Streaming Dataset for Stage 1 Adapter Training
-================================================
+Streaming Dataset for Stage 1 Adapter Training  (Qwen2 edition)
+================================================================
 Sources (all streamed — nothing downloaded upfront):
 
   Primary:
-    openai/librispeech_asr  clean  train.100   (~100h)
-    openai/librispeech_asr  clean  train.360   (~360h)
-    openai/librispeech_asr  other  train.500   (~500h)
-    ──────────────────────────────────────────────────
-    Total primary:                              ~960h
+    openslr/librispeech_asr  clean  train.100   (~100 h)
+    openslr/librispeech_asr  clean  train.360   (~360 h)
+    openslr/librispeech_asr  other  train.500   (~500 h)
+    ─────────────────────────────────────────────────────
+    Total primary:                               ~960 h
 
-  Supplementary (enabled via --extra_data flag):
-    mozilla-foundation/common_voice_13_0  en   (~2,400h validated)
-    facebook/voxpopuli                    en   (~543h)
+  Supplementary (--extra_data flag):
+    mozilla-foundation/common_voice_13_0  en    (~2 400 h validated)
+    facebook/voxpopuli                    en    (~543 h)
 
-  Validation (downloaded fully — only ~5h, fast):
-    openai/librispeech_asr  clean  validation
+  Validation (map-style, ~5 h / ~5 600 samples):
+    openslr/librispeech_asr  clean  validation
 
-Audio format from HuggingFace LibriSpeech:
-  array:        np.float32,  shape (N,)
-  sampling_rate: 16000 Hz
+Audio pipeline:
+  HuggingFace delivers 16 kHz float32 waveforms.
+  We resample to 24 kHz to match the model's expected sample rate.
+  The audio_encoder internally resamples back to 16 kHz for Whisper;
+  the 16→24→16 round-trip is lossless for Whisper (≤8 kHz bandwidth).
 
-Our model expects 24kHz input (audio_encoder resamples 24k→16k internally).
-We resample 16k→24k here. The round-trip 16→24→16 is lossless for Whisper
-because Whisper only sees up to 8kHz bandwidth anyway.
+Prompt format — Qwen2 ChatML:
+  <|im_start|>system
+  You are a helpful assistant.<|im_end|>
+  <|im_start|>user
+  <|begofcAUDIO|><|cAUDIO|>×N<|endofcAUDIO|><|im_end|>
+  <|im_start|>assistant
+  {transcript}<|im_end|>
+
+  Labels: -100 for all prompt tokens; transcript token ids for response.
 """
+
+import os
+os.environ["HF_DATASETS_CACHE"]    = "/workspace/hf_cache"
+os.environ["HF_HOME"]              = "/workspace/hf_home"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "/workspace/hf_hub"
 
 import torch
 import numpy as np
-import torchaudio
 import torchaudio.functional as AF
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, Dataset
 from datasets import load_dataset, interleave_datasets
 
 
-# ── Token sequence length calculator (mirrors modeling_covo_audio.py) ─────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Token-sequence length (mirrors modeling_covo_audio.py conv-stack)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def calc_seq_len(seq_len: int) -> int:
-    for s in [2, 2, 2, 2]:
-        seq_len = (seq_len + s - 1) // s
+    """Compute number of audio tokens after the 4-layer 2× downsampling stack."""
+    for _ in range(4):
+        seq_len = (seq_len + 1) // 2   # ceiling division
     return seq_len
 
 
-# ── Waveform preprocessing ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Waveform preprocessing
+# ─────────────────────────────────────────────────────────────────────────────
 
-def preprocess_wav(array: np.ndarray, src_sr: int, target_sr: int = 24000,
-                   max_duration: float = 30.0) -> torch.Tensor:
+def preprocess_wav(
+    array:       np.ndarray,
+    src_sr:      int,
+    target_sr:   int   = 24_000,
+    max_duration: float = 30.0,
+) -> torch.Tensor:
     """
-    np.ndarray (float32) → torch.Tensor at target_sr, clipped and aligned.
+    np.ndarray (float32, mono) → torch.Tensor at target_sr.
+
+    Steps:
+      1. Resample src_sr → target_sr (usually 16 k → 24 k).
+      2. Clip to max_duration.
+      3. Trim to a multiple of the hop size (target_sr // 100 = 240 @ 24 k).
+      4. Pad to multiple of 480 (model conv-stack requirement).
     """
     wav = torch.from_numpy(array.copy()).float()
 
-    # Resample to target (24kHz for model compatibility)
     if src_sr != target_sr:
         wav = AF.resample(wav, orig_freq=src_sr, new_freq=target_sr)
 
-    # Clip to max duration
     max_samples = int(max_duration * target_sr)
     wav = wav[:max_samples]
 
-    # Align to hop boundary
-    hop = target_sr // 100           # 240 samples @ 24kHz
+    hop = target_sr // 100           # 240 samples @ 24 kHz
     wav = wav[: len(wav) // hop * hop]
 
-    # Pad to multiple of 480 (model requirement)
     rem = wav.shape[0] % 480
     if rem:
         wav = F.pad(wav, (0, 480 - rem))
@@ -72,24 +95,42 @@ def preprocess_wav(array: np.ndarray, src_sr: int, target_sr: int = 24000,
     return wav
 
 
-# ── Sample builder (shared by streaming and map-style) ───────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Sample builder  — Qwen2 ChatML format
+# ─────────────────────────────────────────────────────────────────────────────
 
-def build_sample(wav: torch.Tensor, transcript: str, tokenizer,
-                 audio_token_index: int) -> dict:
+# Default system prompt — can be overridden via build_sample(system_prompt=…)
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def build_sample(
+    wav:               torch.Tensor,
+    transcript:        str,
+    tokenizer,
+    audio_token_index: int,
+    system_prompt:     str = DEFAULT_SYSTEM_PROMPT,
+) -> dict:
     """
-    Given a preprocessed waveform and its transcript, build the tokenized
-    training sample (input_ids, labels, attention_mask).
+    Build a tokenised training sample for Qwen2 (ChatML).
 
-    Prompt format (Gemma 3 chat template):
-        <bos><start_of_turn>user
-        <|begofcAUDIO|><|cAUDIO|>×N<|endofcAUDIO|><end_of_turn>
-        <start_of_turn>model
-        {transcript}<eos>
+    Prompt (not supervised):
+        <|im_start|>system\\n{system_prompt}<|im_end|>\\n
+        <|im_start|>user\\n<|begofcAUDIO|><|cAUDIO|>×N<|endofcAUDIO|><|im_end|>\\n
+        <|im_start|>assistant\\n
 
-    Labels: -100 for prompt tokens, transcript token ids for response.
+    Response (supervised):
+        {transcript}<|im_end|>
+
+    Labels: -100 for prompt positions; token ids for response positions.
+
+    Returns dict with keys:
+        wav            – preprocessed waveform tensor  (float32)
+        input_ids      – token ids                     (long)
+        labels         – supervised targets             (long, -100 masked)
+        attention_mask – 1 everywhere                  (long)
     """
-    # Number of audio placeholder tokens
-    duration_frames  = len(wav) * 100 // 24000
+    # Number of <|cAUDIO|> placeholder tokens
+    duration_frames  = len(wav) * 100 // 24_000
     num_audio_tokens = calc_seq_len(duration_frames)
 
     audio_placeholder = (
@@ -98,15 +139,23 @@ def build_sample(wav: torch.Tensor, transcript: str, tokenizer,
         + "<|endofcAUDIO|>"
     )
 
-    prompt   = f"<start_of_turn>user\n{audio_placeholder}<end_of_turn>\n<start_of_turn>model\n"
-    response = transcript.strip() + tokenizer.eos_token
+    # ── Qwen2 ChatML template ─────────────────────────────────────────────────
+    # We build the string manually so it works regardless of whether the
+    # tokenizer has apply_chat_template configured.
+    prompt = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    # Response ends with <|im_end|> (Qwen2 EOS in chat contexts)
+    response = transcript.strip() + "<|im_end|>"
 
     prompt_ids   = tokenizer(prompt,   add_special_tokens=True,  return_tensors="pt").input_ids[0]
     response_ids = tokenizer(response, add_special_tokens=False, return_tensors="pt").input_ids[0]
 
     input_ids = torch.cat([prompt_ids, response_ids])
     labels    = input_ids.clone()
-    labels[: len(prompt_ids)] = -100   # mask prompt — only supervise response
+    labels[: len(prompt_ids)] = -100   # mask prompt — supervise response only
 
     return {
         "wav":            wav,
@@ -116,25 +165,26 @@ def build_sample(wav: torch.Tensor, transcript: str, tokenizer,
     }
 
 
-# ── Streaming train dataset ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Streaming training dataset
+# ─────────────────────────────────────────────────────────────────────────────
 
 class LibriSpeechStreamingDataset(IterableDataset):
     """
-    Interleaves LibriSpeech train splits (and optionally extra corpora) using
-    HuggingFace datasets streaming. No data is downloaded upfront — samples
-    are fetched and preprocessed on-the-fly.
+    Interleaves LibriSpeech train splits (and optionally CommonVoice / VoxPopuli)
+    using HuggingFace datasets streaming.  No data is downloaded upfront.
 
     Args:
-        tokenizer:          Gemma3 tokenizer with audio special tokens added.
+        tokenizer:          Qwen2 tokenizer with audio special tokens added.
         audio_token_index:  Token id of <|cAUDIO|>.
         use_extra_data:     Also stream CommonVoice-en and VoxPopuli-en.
-        shuffle_buffer:     Size of the in-memory shuffle buffer per dataset.
-        seed:               Random seed for shuffling and interleaving.
+        shuffle_buffer:     In-memory shuffle buffer size per dataset shard.
+        seed:               RNG seed for shuffling and interleaving.
         max_duration:       Skip samples longer than this (seconds).
         min_duration:       Skip samples shorter than this (seconds).
+        system_prompt:      System message inserted before each user turn.
     """
 
-    # (hf_dataset_id, config_name, split)
     LIBRISPEECH_SPLITS = [
         ("openslr/librispeech_asr", "clean", "train.100"),
         ("openslr/librispeech_asr", "clean", "train.360"),
@@ -150,10 +200,11 @@ class LibriSpeechStreamingDataset(IterableDataset):
         tokenizer,
         audio_token_index: int,
         use_extra_data:    bool  = False,
-        shuffle_buffer:    int   = 1000,
+        shuffle_buffer:    int   = 1_000,
         seed:              int   = 42,
-        max_duration:      float = 20.0,   # skip very long utterances
-        min_duration:      float = 1.0,    # skip very short utterances
+        max_duration:      float = 20.0,
+        min_duration:      float = 1.0,
+        system_prompt:     str   = DEFAULT_SYSTEM_PROMPT,
     ):
         self.tokenizer         = tokenizer
         self.audio_token_index = audio_token_index
@@ -162,39 +213,32 @@ class LibriSpeechStreamingDataset(IterableDataset):
         self.seed              = seed
         self.max_duration      = max_duration
         self.min_duration      = min_duration
+        self.system_prompt     = system_prompt
 
         self._dataset = self._build_interleaved()
 
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
     def _load_split(self, dataset_id: str, config: str, split: str):
-        """Load one HuggingFace split in streaming mode with shuffle buffer."""
         ds = load_dataset(
             dataset_id,
             config,
             split=split,
             streaming=True,
+            cache_dir="/workspace/",
             trust_remote_code=True,
         )
         return ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
 
     def _build_interleaved(self):
-        """
-        Build the interleaved streaming dataset.
-        LibriSpeech splits are weighted proportionally to their size.
-        Extra data (if enabled) is given lower weight to avoid domain shift.
-        """
-        splits      = list(self.LIBRISPEECH_SPLITS)
-        # Weights proportional to hours: 100, 360, 500 → normalise
-        ls_weights  = [100, 360, 500]
+        splits     = list(self.LIBRISPEECH_SPLITS)
+        ls_weights = [100, 360, 500]   # proportional to hours
 
         if self.use_extra_data:
             splits     += list(self.EXTRA_SPLITS)
-            # Extra datasets given 10% combined weight each
-            ls_weights += [100, 60]   # rough CommonVoice-en and VoxPopuli-en sizes
+            ls_weights += [100, 60]    # rough CommonVoice & VoxPopuli weights
 
-        datasets_list = [
-            self._load_split(did, cfg, sp)
-            for did, cfg, sp in splits
-        ]
+        datasets_list = [self._load_split(d, c, s) for d, c, s in splits]
 
         total = sum(ls_weights)
         probs = [w / total for w in ls_weights]
@@ -206,16 +250,25 @@ class LibriSpeechStreamingDataset(IterableDataset):
             stopping_strategy="all_exhausted",
         )
 
-    def _extract_audio_text(self, sample: dict):
+    @staticmethod
+    def _extract_audio_text(sample: dict):
         """
-        Normalise audio/text field names across different HuggingFace datasets.
-        LibriSpeech:  sample["audio"]["array"], sample["text"]
-        CommonVoice:  sample["audio"]["array"], sample["sentence"]
-        VoxPopuli:    sample["audio"]["array"], sample["normalized_text"]
+        Normalise audio/text field names across HuggingFace datasets.
+        Handles plain dicts, AudioDecoder objects, and VoxPopuli-style objects.
         """
-        audio_dict = sample.get("audio", {})
-        array      = audio_dict.get("array")
-        sr         = audio_dict.get("sampling_rate", 16000)
+        audio_obj = sample["audio"]
+
+        if isinstance(audio_obj, dict):
+            array, sr = audio_obj.get("array"), audio_obj.get("sampling_rate")
+        elif hasattr(audio_obj, "array") and hasattr(audio_obj, "sampling_rate"):
+            array, sr = audio_obj.array, audio_obj.sampling_rate
+        elif hasattr(audio_obj, "get_all_samples"):
+            decoded = audio_obj.get_all_samples()
+            array   = decoded.data.squeeze(0).numpy()
+            sr      = decoded.sample_rate
+        else:
+            array, sr = audio_obj["array"], audio_obj["sampling_rate"]
+
         transcript = (
             sample.get("text")
             or sample.get("sentence")
@@ -224,44 +277,53 @@ class LibriSpeechStreamingDataset(IterableDataset):
         ).strip()
         return array, sr, transcript
 
+    # ── IterableDataset protocol ──────────────────────────────────────────────
+
     def __iter__(self):
         for sample in self._dataset:
             array, sr, transcript = self._extract_audio_text(sample)
 
-            # ── Filter ────────────────────────────────────────────────────────
             if array is None or not transcript:
                 continue
             duration = len(array) / sr
             if duration < self.min_duration or duration > self.max_duration:
                 continue
 
-            # ── Preprocess ────────────────────────────────────────────────────
             try:
                 wav = preprocess_wav(array, src_sr=sr)
             except Exception:
-                continue   # skip corrupt samples silently
+                continue
 
-            yield build_sample(wav, transcript, self.tokenizer, self.audio_token_index)
+            yield build_sample(
+                wav, transcript,
+                self.tokenizer, self.audio_token_index,
+                system_prompt=self.system_prompt,
+            )
 
 
-# ── Validation dataset (map-style, fully loaded) ─────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Map-style validation dataset
+# ─────────────────────────────────────────────────────────────────────────────
 
-class LibriSpeechValDataset(torch.utils.data.Dataset):
+class LibriSpeechValDataset(Dataset):
     """
-    Loads LibriSpeech validation.clean fully into memory.
-    It's only ~5h / ~5,600 samples — no need to stream.
-
-    This gives us a deterministic, fixed validation set we can iterate
-    in a consistent order every eval step.
+    Loads LibriSpeech validation.clean fully into memory (~5 h / ~5 600 samples).
+    Pre-processes all samples once so each validation pass is fast and
+    perfectly deterministic.
     """
 
-    def __init__(self, tokenizer, audio_token_index: int,
-                 max_duration: float = 20.0):
+    def __init__(
+        self,
+        tokenizer,
+        audio_token_index: int,
+        max_duration:  float = 20.0,
+        system_prompt: str   = DEFAULT_SYSTEM_PROMPT,
+    ):
         self.tokenizer         = tokenizer
         self.audio_token_index = audio_token_index
-        self.max_duration      = max_duration
+        self.system_prompt     = system_prompt
 
-        print("[ValDataset] Loading librispeech validation.clean (streaming=False)...")
+        print("[ValDataset] Loading librispeech_asr validation.clean …")
         raw = load_dataset(
             "openslr/librispeech_asr",
             "clean",
@@ -269,16 +331,15 @@ class LibriSpeechValDataset(torch.utils.data.Dataset):
             streaming=False,
             trust_remote_code=True,
         )
-        # Pre-process all samples once so validation is fast
-        self.samples = []
+
+        self.samples: list[tuple[torch.Tensor, str]] = []
         skipped = 0
         for item in raw:
             array = item["audio"]["array"]
             sr    = item["audio"]["sampling_rate"]
             text  = item["text"].strip()
 
-            duration = len(array) / sr
-            if duration > max_duration or not text:
+            if len(array) / sr > max_duration or not text:
                 skipped += 1
                 continue
             try:
@@ -288,12 +349,16 @@ class LibriSpeechValDataset(torch.utils.data.Dataset):
                 continue
             self.samples.append((wav, text))
 
-        print(f"[ValDataset] {len(self.samples)} val samples "
-              f"({skipped} skipped). Ready.")
+        print(f"[ValDataset] {len(self.samples)} samples ready "
+              f"({skipped} skipped).")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict:
         wav, transcript = self.samples[idx]
-        return build_sample(wav, transcript, self.tokenizer, self.audio_token_index)
+        return build_sample(
+            wav, transcript,
+            self.tokenizer, self.audio_token_index,
+            system_prompt=self.system_prompt,
+        )

@@ -1,121 +1,102 @@
 """
-CovoAudioConfig
-================
-Updated for:
-  - Gemma 3 4B IT  (hidden_size=2560, 34 layers, 16 heads)
-  - Whisper Medium  (d_model=1024, num_mel_bins=80)
+CovoAudioConfig — Qwen2.5-3B-Instruct + Whisper-Small backbone.
 
-IMPORTANT — Required patch in modeling_covo_audio.py:
-  Change line in audio_encoder():
-    FROM: mel_features = log_mel_spectrogram(audio, n_mels=128)
-    TO:   mel_features = log_mel_spectrogram(audio, n_mels=self.config.encoder_config.num_mel_bins)
-
-  Reason: Whisper Large-V3 uses 128 mel bins; Whisper Medium uses 80.
-  The original hardcoded 128 will crash with a shape mismatch on
-  WhisperEncoder.conv1 (in_channels=80 vs input channels=128).
+Key design decisions:
+  - LLM: Qwen2 (qwen2) via transformers >= 4.37
+  - Encoder: Whisper Small (80-mel, d_model=768)
+  - audio_token_index matches Qwen2.5's vocab boundary (151936)
+  - adapter_downsample=8 → 8× temporal compression of Whisper frames
 """
-
 from typing import Optional
-from transformers import Gemma3TextConfig, WhisperConfig
-from transformers.configuration_utils import PretrainedConfig
+from transformers import WhisperConfig, PretrainedConfig
+
+try:
+    from transformers import Qwen2Config as LLMConfig
+    LLM_MODEL_TYPE = "qwen2"
+except ImportError:
+    raise ImportError("transformers >= 4.37 is required for Qwen2Config.")
 
 
 class CovoAudioConfig(PretrainedConfig):
     model_type = "covo_audio"
     sub_configs = {
-        "llm_config":     Gemma3TextConfig,
+        "llm_config":     LLMConfig,
         "encoder_config": WhisperConfig,
     }
     has_no_defaults_at_init = True
 
     def __init__(
         self,
-        llm_config:     Optional[Gemma3TextConfig] = None,
-        encoder_config: Optional[WhisperConfig]    = None,
-        audio_token_index: int = 262208,
-        adapter_downsample: int = 8,
+        llm_config:         Optional[LLMConfig]     = None,
+        encoder_config:     Optional[WhisperConfig]  = None,
+        audio_token_index:  int   = 151936,   # first token after Qwen2.5 base vocab
+        adapter_downsample: int   = 8,
+        # ── Alignment loss hyperparams ───────────────────────────────────────
+        # Weight for the cosine-embedding alignment loss term.
+        # Set to 0.0 to disable; 0.1 is a safe starting point.
+        alignment_loss_weight: float = 0.1,
         **kwargs,
     ):
-        # ── Gemma 3 4B IT ─────────────────────────────────────────────────────
+        # ── Qwen 2.5 3B Instruct ─────────────────────────────────────────────
         if llm_config is None:
-            llm_config = Gemma3TextConfig(
-                # Identity
-                architectures=["Gemma3ForCausalLM"],
-                model_type="gemma3_text",
+            llm_config = LLMConfig(
+                architectures=["Qwen2ForCausalLM"],
+                model_type="qwen2",
 
-                # Vocabulary
-                vocab_size=262208,
+                # Vocabulary — standard Qwen2.5-3B-Instruct
+                vocab_size=151936,
 
-                # Architecture — Gemma 3 4B
-                hidden_size=2560,
-                intermediate_size=10240,
-                num_hidden_layers=34,
+                # Architecture
+                hidden_size=2048,
+                intermediate_size=11008,
+                num_hidden_layers=36,
                 num_attention_heads=16,
-                num_key_value_heads=8,
-                head_dim=256,
+                num_key_value_heads=2,
+                head_dim=128,           # hidden_size // num_attention_heads
 
-                # Activation
-                hidden_activation="gelu_pytorch_tanh",
+                hidden_act="silu",
 
-                # Position encoding
-                max_position_embeddings=131072,
+                max_position_embeddings=32768,
                 rope_theta=1000000.0,
                 rope_scaling=None,
 
-                # Attention
-                # Gemma 3 4B alternates local (sliding_window=1024) and
-                # global attention layers. Keep the default here;
-                # set sliding_window=None only if you encounter OOM on
-                # very long audio sequences (> 30s stacked context).
-                sliding_window=1024,
                 attention_dropout=0.0,
-                attention_bias=False,
-
-                # Normalization
                 rms_norm_eps=1e-6,
                 initializer_range=0.02,
 
-                # Tokens
-                bos_token_id=2,
-                eos_token_id=1,
-                pad_token_id=0,
+                # Qwen2.5-3B-Instruct special tokens
+                # <|endoftext|>=151643  <|im_start|>=151644  <|im_end|>=151645
+                bos_token_id=151643,
+                eos_token_id=151645,   # <|im_end|> used as EOS in ChatML
+                pad_token_id=151643,
 
                 use_cache=True,
-
-                # IMPORTANT: tie_word_embeddings=True is Gemma's default but
-                # CovoAudioForCausalLM.tie_weights() is a no-op, so in practice
-                # lm_head and input embeddings are NOT shared.
-                # Keep True for config compatibility; the no-op override handles it.
-                tie_word_embeddings=True,
-
+                tie_word_embeddings=False,
                 torch_dtype="bfloat16",
             )
 
-        # ── Whisper Medium ─────────────────────────────────────────────────────
+        # ── Whisper Small ─────────────────────────────────────────────────────
         if encoder_config is None:
             encoder_config = WhisperConfig(
-                _name_or_path="openai/whisper-medium",
+                _name_or_path="openai/whisper-small",
                 architectures=["WhisperForConditionalGeneration"],
                 model_type="whisper",
 
                 vocab_size=51865,
 
-                # num_mel_bins=80 is correct for Whisper Medium.
-                # Whisper Large-V3 uses 128. Do NOT change this to 128 here —
-                # it would mismatch the pretrained conv1 weights.
+                # 80 mel bins — DO NOT change to 128 (that is Large-V3 only)
                 num_mel_bins=80,
 
-                # Encoder architecture
-                d_model=1024,
-                encoder_layers=24,
-                encoder_attention_heads=16,
-                encoder_ffn_dim=4096,
+                # Encoder — Whisper Small
+                d_model=768,
+                encoder_layers=12,
+                encoder_attention_heads=12,
+                encoder_ffn_dim=3072,
 
-                # Decoder architecture (not used during inference/training here
-                # but required for WhisperConfig to be valid)
-                decoder_layers=24,
-                decoder_attention_heads=16,
-                decoder_ffn_dim=4096,
+                # Decoder kept for config validity; not used during training
+                decoder_layers=12,
+                decoder_attention_heads=12,
+                decoder_ffn_dim=3072,
 
                 activation_function="gelu",
 
@@ -151,15 +132,18 @@ class CovoAudioConfig(PretrainedConfig):
                 median_filter_width=7,
                 torch_dtype="float16",
                 use_weighted_layer_sum=False,
-                num_hidden_layers=24,
+                num_hidden_layers=12,
             )
 
-        self.audio_token_index  = audio_token_index
-        self.adapter_downsample = adapter_downsample
-        self.llm_config         = llm_config
-        self.encoder_config     = encoder_config
-        # Derived: adapter input dim comes from Whisper encoder output
-        self.whisper_feats_dim  = encoder_config.d_model   # 1024 for medium
+        self.audio_token_index     = audio_token_index
+        self.adapter_downsample    = adapter_downsample
+        self.alignment_loss_weight = alignment_loss_weight
+        self.llm_config            = llm_config
+        self.encoder_config        = encoder_config
+
+        # Derived: adapter output must match LLM hidden size
+        self.whisper_feats_dim = encoder_config.d_model    # 768  (Whisper Small)
+        self.llm_hidden_size   = llm_config.hidden_size    # 2048 (Qwen2.5-3B)
 
         if "dtype" not in kwargs:
             kwargs["dtype"] = "bfloat16"
@@ -170,22 +154,22 @@ class CovoAudioConfig(PretrainedConfig):
     # ── Convenience properties ─────────────────────────────────────────────────
 
     @property
-    def num_hidden_layers(self):
-        return self.llm_config.num_hidden_layers   # 34 for 4B
+    def num_hidden_layers(self) -> int:
+        return self.llm_config.num_hidden_layers   # 36
 
     @property
-    def hidden_size(self):
-        return self.llm_config.hidden_size          # 2560 for 4B
+    def hidden_size(self) -> int:
+        return self.llm_config.hidden_size          # 2048
 
     # ── Serialization ──────────────────────────────────────────────────────────
 
     def to_dict(self):
         output = super().to_dict()
         if hasattr(self, "llm_config") and isinstance(self.llm_config, PretrainedConfig):
-            output["llm_config"]      = self.llm_config.to_dict()
+            output["llm_config"]       = self.llm_config.to_dict()
             output["_llm_config_type"] = getattr(self.llm_config, "model_type", None)
         if hasattr(self, "encoder_config") and isinstance(self.encoder_config, PretrainedConfig):
-            output["encoder_config"]      = self.encoder_config.to_dict()
+            output["encoder_config"]       = self.encoder_config.to_dict()
             output["_encoder_config_type"] = getattr(self.encoder_config, "model_type", None)
         return output
 

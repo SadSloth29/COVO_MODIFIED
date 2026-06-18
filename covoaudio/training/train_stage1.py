@@ -1,670 +1,617 @@
 """
-Stage 1 Training — Adapter Alignment (LibriSpeech, Streaming)
-==============================================================
-Multi-GPU training via torchrun (DistributedDataParallel).
+Stage 1 Adapter Training — CovoAudio + Qwen2.5-3B-Instruct
+===========================================================
 
-Launch command (2 GPUs):
-    torchrun --nproc_per_node=2 training/train_stage1.py [args]
+Key design choices vs. the original pipeline:
+  1. Epoch-based training   — no step budget; loops for `--num_epochs` full
+                              passes over the (streamed) dataset.
+  2. Epoch-level LR warmup  — LR ramps linearly over the first 50 % of epochs,
+                              then cosine-decays to a small floor (1 % of peak).
+  3. Dual loss              — cross-entropy (ASR) + cosine-embedding alignment.
 
-Single GPU (no change to args):
-    python training/train_stage1.py [args]
+Loss function detail
+────────────────────
+The adapter projects Whisper encoder outputs (768-d) into the Qwen2 hidden
+space (2048-d).  To explicitly encourage the adapter to land in the LLM's
+embedding manifold we add a cosine-embedding alignment term:
 
-What is frozen vs trained:
-    FROZEN:  WhisperEncoder  (pretrained openai/whisper-medium)
-    FROZEN:  Gemma 3 4B LLM  (pretrained google/gemma-3-4b-it)
-    TRAINED: AudioAdapter    (~30M params)
+    L_align = 1 − cos(adapter_out, lm_embed_lookup(ground_truth_tokens))
+
+This is averaged only over positions that carry a real audio token
+(input_ids == audio_token_index) so it does not interfere with text positions.
+
+Total loss:
+    L = L_ce + λ · L_align          (λ = config.alignment_loss_weight, default 0.1)
+
+CLI usage
+─────────
+    python train.py \\
+        --output_dir /workspace/checkpoints \\
+        --num_epochs 10 \\
+        --batch_size 4 \\
+        --grad_accum 4 \\
+        --lr 2e-4 \\
+        --extra_data          # optional: adds CommonVoice + VoxPopuli
 """
 
+from __future__ import annotations
+
+import argparse
+import math
 import os
 import sys
-import logging
-import argparse
+import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
-from transformers import AutoTokenizer, WhisperModel
-from transformers.models.gemma3 import Gemma3ForCausalLM
+from transformers import AutoTokenizer, get_scheduler
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# ── Local imports ─────────────────────────────────────────────────────────────
+# Adjust sys.path if running from the repo root
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from modeling_covo_audio import CovoAudioForCausalLM, sequence_mask
-from configuration_covo_audio import CovoAudioConfig
-from training.dataset  import LibriSpeechStreamingDataset, LibriSpeechValDataset
-from training.collator import AudioTextCollator
+from covoaudio.configuration_covo_audio import CovoAudioConfig
+from covoaudio.modeling_covo_audio import CovoAudioForConditionalGeneration
+from covoaudio.training.dataset import (
+    LibriSpeechStreamingDataset,
+    LibriSpeechValDataset,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Distributed helpers
+# Collator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_distributed():
+class AudioSpeechCollator:
     """
-    Initialise the process group when launched via torchrun.
-    Falls back to single-GPU if env vars are not set.
+    Pad a batch of samples from build_sample() to uniform length.
+
+    Padding strategy:
+      • input_ids / attention_mask — right-padded with pad_token_id / 0
+      • labels                     — right-padded with -100
+      • wav                        — right-padded with zeros
     """
-    if "LOCAL_RANK" not in os.environ:
-        return 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    local_rank  = int(os.environ["LOCAL_RANK"])
-    world_size  = int(os.environ["WORLD_SIZE"])
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
 
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    def __call__(self, batch: list[dict]) -> dict:
+        max_len  = max(b["input_ids"].shape[0] for b in batch)
+        max_wav  = max(b["wav"].shape[0]        for b in batch)
 
-    return local_rank, world_size, torch.device(f"cuda:{local_rank}")
+        input_ids_list  = []
+        labels_list     = []
+        attn_mask_list  = []
+        wav_list        = []
 
+        for b in batch:
+            seq_len  = b["input_ids"].shape[0]
+            wav_len  = b["wav"].shape[0]
+            pad_seq  = max_len - seq_len
+            pad_wav  = max_wav - wav_len
 
-def is_main_process():
-    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+            input_ids_list.append(
+                F.pad(b["input_ids"],      (0, pad_seq), value=self.pad_token_id))
+            labels_list.append(
+                F.pad(b["labels"],         (0, pad_seq), value=-100))
+            attn_mask_list.append(
+                F.pad(b["attention_mask"], (0, pad_seq), value=0))
+            wav_list.append(
+                F.pad(b["wav"],            (0, pad_wav), value=0.0))
 
-
-def barrier():
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-
-
-def setup_logging(local_rank: int):
-    """Only rank 0 logs — all other ranks are silent."""
-    level = logging.INFO if local_rank == 0 else logging.WARNING
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    return logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Adapter dropout wrapper
-# ─────────────────────────────────────────────────────────────────────────────
-
-class DropoutWrapper(nn.Module):
-    def __init__(self, module: nn.Module, p: float = 0.1):
-        super().__init__()
-        self.module  = module
-        self.dropout = nn.Dropout(p=p)
-
-    def forward(self, x):
-        return self.dropout(self.module(x))
-
-
-def add_adapter_dropout(model: CovoAudioForCausalLM, p: float = 0.1):
-    layers = model.audio_adapter.downsample_layers
-    for i in range(len(layers)):
-        layers[i] = DropoutWrapper(layers[i], p=p)
+        return {
+            "input_ids":      torch.stack(input_ids_list),
+            "labels":         torch.stack(labels_list),
+            "attention_mask": torch.stack(attn_mask_list),
+            "wav":            torch.stack(wav_list),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Audio injection  (training-time forward pass)
+# Alignment loss
 # ─────────────────────────────────────────────────────────────────────────────
 
-def inject_audio(
-    model,                  # raw model (not DDP wrapper) for audio_encoder access
-    ddp_model,              # DDP-wrapped model for embedding lookup
-    wavs:              list,
-    input_ids:         torch.Tensor,
-    audio_token_index: int,
-    log,
-    debug_norms:       bool = False,
+def compute_alignment_loss(
+    adapter_outputs:    torch.Tensor,   # (B, T_total, D_llm)
+    input_ids:          torch.Tensor,   # (B, T_total)
+    lm_embedding_table: nn.Embedding,   # (vocab_size, D_llm)
+    labels:             torch.Tensor,   # (B, T_total)
+    audio_token_index:  int,
 ) -> torch.Tensor:
     """
-    Replaces <|cAUDIO|> placeholder embeddings with audio features.
+    Cosine-embedding alignment loss.
 
-    Args:
-        model:     The unwrapped CovoAudioForCausalLM (for audio_encoder).
-        ddp_model: The DDP-wrapped model (for get_input_embeddings).
-        debug_norms: When True, logs audio vs text embedding magnitudes.
-                     Enable for the first few steps to diagnose loss=93.
+    For positions where input_ids == audio_token_index (i.e. the audio
+    placeholder slots), we compare:
+      • adapter_out[pos]    — what the adapter actually produced
+      • lm_embed(label[pos+1]) — the LLM embedding of the *next* ground-truth
+                                 text token (the immediately following token
+                                 the model is trying to predict)
+
+    Intuition: the adapter's final audio token should be "close to" the
+    embedding of the first word of the transcript, guiding the adapter to
+    bridge the audio–text modality gap.
+
+    Only positions that are both:
+      (a) audio placeholder tokens  AND
+      (b) followed by a valid (≥0) label
+    are included in the average.
+
+    Returns scalar loss (0 if no valid positions in batch).
     """
-    device = input_ids.device
-    # Get the underlying module whether DDP or not
-    base = ddp_model.module if hasattr(ddp_model, "module") else ddp_model
-    dtype = next(base.llm.parameters()).dtype
+    B, T, D = adapter_outputs.shape
+
+    # Audio positions: (B, T) boolean mask
+    audio_mask = (input_ids == audio_token_index)   # True where <|cAUDIO|>
+
+    # Shift labels left by 1 to get the "next token" for each position
+    # Pad the last position with -100 so it's excluded.
+    next_labels = torch.full_like(labels, -100)
+    next_labels[:, :-1] = labels[:, 1:]
+
+    # Valid: audio position AND the following label is a real token (not -100)
+    valid_mask = audio_mask & (next_labels >= 0)    # (B, T)
+
+    if not valid_mask.any():
+        return adapter_outputs.new_tensor(0.0)
+
+    # Gather adapter outputs and target embeddings for valid positions
+    adapter_vecs = adapter_outputs[valid_mask]                  # (N, D)
+    target_ids   = next_labels[valid_mask]                      # (N,)
 
     with torch.no_grad():
-        inputs_embeds = base.llm.get_input_embeddings()(input_ids)  # (B, L, H)
+        target_vecs = lm_embedding_table(target_ids)            # (N, D)
 
-    for b, wav in enumerate(wavs):
-        n_placeholders = (input_ids[b] == audio_token_index).sum().item()
-
-        if debug_norms:
-            text_norm = inputs_embeds[b].norm(dim=-1).mean().item()
-            log.info(
-                f"[norm-debug] sample={b}  "
-                f"placeholders={n_placeholders}  "
-                f"text_embed_norm={text_norm:.6f}"
-            )
-            if n_placeholders == 0:
-                log.warning(
-                    f"[norm-debug] sample={b} has ZERO placeholders — "
-                    f"audio_token_index={audio_token_index} not found in input_ids. "
-                    f"Audio injection is silently failing."
-                )
-                continue
-
-        if n_placeholders == 0:
-            continue
-
-        audio_feats = model.audio_encoder([wav.to(device)], device)  # (1, T, H)
-
-        if debug_norms:
-            audio_norm = audio_feats.norm(dim=-1).mean().item()
-            ratio      = audio_norm / max(text_norm, 1e-9)
-            log.info(
-                f"[norm-debug] sample={b}  "
-                f"audio_feat_norm={audio_norm:.6f}  "
-                f"text_embed_norm={text_norm:.6f}  "
-                f"ratio={ratio:.1f}x  "
-                f"{'⚠ LARGE RATIO — adapter magnitude problem' if ratio > 10 else 'OK'}"
-            )
-
-        T = audio_feats.shape[1]
-        if T > n_placeholders:
-            audio_feats = audio_feats[:, :n_placeholders, :]
-        elif T < n_placeholders:
-            pad = torch.zeros(
-                1, n_placeholders - T, audio_feats.shape[2],
-                device=device, dtype=audio_feats.dtype,
-            )
-            audio_feats = torch.cat([audio_feats, pad], dim=1)
-
-        mask = (input_ids[b] == audio_token_index)
-        inputs_embeds[b][mask] = audio_feats[0].to(dtype)
-
-    return inputs_embeds
+    # cosine_embedding_loss with target=1 means "make them similar"
+    targets = adapter_vecs.new_ones(adapter_vecs.shape[0])      # all +1
+    loss = F.cosine_embedding_loss(
+        adapter_vecs,
+        target_vecs,
+        targets,
+        margin=0.0,
+        reduction="mean",
+    )
+    return loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Param groups  (weight decay only on weight matrices, not biases/norms)
+# Epoch-level cosine LR schedule with linear warmup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_adapter_param_groups(model: CovoAudioForCausalLM, weight_decay: float):
-    decay, no_decay = [], []
-    for name, param in model.audio_adapter.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "bias" in name or "norm" in name.lower():
-            no_decay.append(param)
+class EpochWarmupCosineScheduler:
+    """
+    Epoch-granularity scheduler:
+      • epochs  0 … floor(warmup_frac × num_epochs) - 1 : linear ramp  0 → lr
+      • epochs  warmup_end … num_epochs - 1              : cosine decay lr → lr_min
+
+    Call scheduler.step(epoch) at the START of each epoch (before any
+    optimizer.step calls inside that epoch).
+
+    Args:
+        optimizer:     PyTorch optimizer.
+        num_epochs:    Total number of training epochs.
+        warmup_frac:   Fraction of epochs used for warmup (default 0.5 → 50 %).
+        lr_min_frac:   LR floor as a fraction of peak LR (default 0.01 → 1 %).
+    """
+
+    def __init__(
+        self,
+        optimizer:    torch.optim.Optimizer,
+        num_epochs:   int,
+        warmup_frac:  float = 0.5,
+        lr_min_frac:  float = 0.01,
+    ):
+        self.optimizer   = optimizer
+        self.num_epochs  = num_epochs
+        self.warmup_end  = max(1, math.floor(warmup_frac * num_epochs))
+        self.lr_min_frac = lr_min_frac
+        # Capture base LRs from param groups
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+
+    def _compute_lr(self, epoch: int, base_lr: float) -> float:
+        lr_min = base_lr * self.lr_min_frac
+        if epoch < self.warmup_end:
+            # Linear warmup: epoch 0 → tiny, epoch warmup_end-1 → base_lr
+            return base_lr * (epoch + 1) / self.warmup_end
         else:
-            decay.append(param)
-    return [
-        {"params": decay,    "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
+            # Cosine decay from base_lr to lr_min
+            progress = (epoch - self.warmup_end) / max(
+                1, self.num_epochs - self.warmup_end - 1
+            )
+            cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return lr_min + (base_lr - lr_min) * cosine
+
+    def step(self, epoch: int):
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            pg["lr"] = self._compute_lr(epoch, base_lr)
+
+    def get_last_lr(self) -> list[float]:
+        return [pg["lr"] for pg in self.optimizer.param_groups]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Loss with label smoothing
+# Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-_loss_fn = None
+def train_one_epoch(
+    model:             CovoAudioForConditionalGeneration,
+    loader:            DataLoader,
+    optimizer:         torch.optim.Optimizer,
+    device:            torch.device,
+    epoch:             int,
+    grad_accum:        int,
+    alignment_weight:  float,
+    audio_token_index: int,
+    max_grad_norm:     float = 1.0,
+    log_every:         int   = 50,
+) -> dict:
+    """Run one full pass over the (streaming) training data."""
+    model.train()
 
-def compute_loss(logits: torch.Tensor, labels: torch.Tensor,
-                 label_smoothing: float = 0.1) -> torch.Tensor:
-    global _loss_fn
-    if _loss_fn is None:
-        _loss_fn = nn.CrossEntropyLoss(ignore_index=-100,
-                                       label_smoothing=label_smoothing)
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:  ].contiguous()
-    return _loss_fn(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-    )
+    total_ce_loss    = 0.0
+    total_align_loss = 0.0
+    total_loss       = 0.0
+    steps            = 0
+    optimizer.zero_grad()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Validation  (rank 0 only)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def evaluate(model, val_loader, audio_token_index, device,
-             max_val_batches: int, log) -> float:
-    model.eval()
-    base     = model.module if hasattr(model, "module") else model
-    loss_fn  = nn.CrossEntropyLoss(ignore_index=-100)
-    total, n = 0.0, 0
-
-    pbar = tqdm(
-        val_loader,
-        desc="Validating",
-        total=max_val_batches,
-        leave=False,
-        disable=not is_main_process(),
-    )
-    for batch in pbar:
-        if n >= max_val_batches:
-            break
+    for step, batch in enumerate(loader):
         input_ids      = batch["input_ids"].to(device)
         labels         = batch["labels"].to(device)
         attention_mask = batch["attention_mask"].to(device)
+        wav            = batch["wav"].to(device)
 
-        inputs_embeds = inject_audio(
-            base, model, batch["wavs"], input_ids, audio_token_index,
-            log, debug_norms=False,
-        )
+        # ── Forward pass ──────────────────────────────────────────────────────
         outputs = model(
-            inputs_embeds=inputs_embeds,
+            input_ids=input_ids,
             attention_mask=attention_mask,
+            labels=labels,
+            wav=wav,
+            output_adapter_hidden_states=True,  # needed for alignment loss
         )
-        shift_logits = outputs.logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        loss = loss_fn(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+
+        ce_loss    = outputs.loss
+        align_loss = torch.tensor(0.0, device=device)
+
+        # ── Alignment loss ────────────────────────────────────────────────────
+        if alignment_weight > 0.0 and hasattr(outputs, "adapter_hidden_states"):
+            # adapter_hidden_states: (B, T_audio, D_llm)
+            # We need to scatter them back into the full-sequence positions.
+            # model.get_input_embeddings() returns the LM embed table.
+            lm_embed = model.language_model.get_input_embeddings()
+
+            # Get the full-sequence hidden states at the audio positions.
+            # The model's forward places adapter embeddings at audio positions
+            # inside inputs_embeds before the LM forward.
+            # We use the model's stored adapter_hidden_states (already projected
+            # to D_llm) and the input_ids mask to align positions.
+            align_loss = compute_alignment_loss(
+                adapter_outputs=outputs.adapter_hidden_states,  # (B, T_full, D_llm)
+                input_ids=input_ids,
+                lm_embedding_table=lm_embed,
+                labels=labels,
+                audio_token_index=audio_token_index,
+            )
+
+        loss = ce_loss + alignment_weight * align_loss
+
+        # ── Backward + accumulate ─────────────────────────────────────────────
+        (loss / grad_accum).backward()
+
+        total_ce_loss    += ce_loss.item()
+        total_align_loss += align_loss.item()
+        total_loss       += loss.item()
+        steps            += 1
+
+        if (step + 1) % grad_accum == 0:
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        if (step + 1) % log_every == 0:
+            avg_ce    = total_ce_loss    / steps
+            avg_align = total_align_loss / steps
+            avg_total = total_loss       / steps
+            print(
+                f"  [epoch {epoch+1}  step {step+1}] "
+                f"ce={avg_ce:.4f}  align={avg_align:.4f}  total={avg_total:.4f}"
+            )
+
+    # Flush any remaining gradient accumulation buffer
+    if steps % grad_accum != 0:
+        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return {
+        "ce_loss":    total_ce_loss    / max(steps, 1),
+        "align_loss": total_align_loss / max(steps, 1),
+        "total_loss": total_loss       / max(steps, 1),
+    }
+
+
+@torch.no_grad()
+def validate(
+    model:             CovoAudioForConditionalGeneration,
+    loader:            DataLoader,
+    device:            torch.device,
+    alignment_weight:  float,
+    audio_token_index: int,
+) -> dict:
+    """Compute validation losses over the fixed val set."""
+    model.eval()
+
+    total_ce    = 0.0
+    total_align = 0.0
+    total       = 0.0
+    n           = 0
+
+    for batch in loader:
+        input_ids      = batch["input_ids"].to(device)
+        labels         = batch["labels"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        wav            = batch["wav"].to(device)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            wav=wav,
+            output_adapter_hidden_states=True,
         )
-        total += loss.item()
-        n     += 1
-        pbar.set_postfix(val_loss=f"{total/n:.4f}")
 
-    model.train()
-    return total / max(n, 1)
+        ce_loss    = outputs.loss
+        align_loss = torch.tensor(0.0, device=device)
 
+        if alignment_weight > 0.0 and hasattr(outputs, "adapter_hidden_states"):
+            lm_embed   = model.language_model.get_input_embeddings()
+            align_loss = compute_alignment_loss(
+                outputs.adapter_hidden_states,
+                input_ids,
+                lm_embed,
+                labels,
+                audio_token_index,
+            )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Checkpoint  (rank 0 only)
-# ─────────────────────────────────────────────────────────────────────────────
+        total_ce    += ce_loss.item()
+        total_align += align_loss.item()
+        total       += (ce_loss + alignment_weight * align_loss).item()
+        n           += 1
 
-def save_checkpoint(model, tokenizer, output_dir, tag, step, val_loss, log):
-    if not is_main_process():
-        return
-    path = Path(output_dir) / tag
-    path.mkdir(parents=True, exist_ok=True)
-
-    base = model.module if hasattr(model, "module") else model
-    torch.save(
-        {
-            "adapter_state_dict": base.audio_adapter.state_dict(),
-            "step":               step,
-            "val_loss":           val_loss,
-        },
-        path / "audio_adapter.pt",
-    )
-    base.config.save_pretrained(path)
-    tokenizer.save_pretrained(path)
-    log.info(f"  ✓ Saved → {path}  (step={step}  val_loss={val_loss:.4f})")
+    return {
+        "val_ce":    total_ce    / max(n, 1),
+        "val_align": total_align / max(n, 1),
+        "val_loss":  total       / max(n, 1),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train(args):
-    local_rank, world_size, device = setup_distributed()
-    log = setup_logging(local_rank)
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Stage-1 adapter training for CovoAudio (Qwen2 + Whisper)"
+    )
+    p.add_argument("--model_name_or_path", default=None,
+                   help="Pretrained checkpoint dir; if None, init from config.")
+    p.add_argument("--output_dir",         required=True)
+    p.add_argument("--num_epochs",         type=int,   default=10)
+    p.add_argument("--batch_size",         type=int,   default=4)
+    p.add_argument("--grad_accum",         type=int,   default=4)
+    p.add_argument("--lr",                 type=float, default=2e-4)
+    p.add_argument("--weight_decay",       type=float, default=0.01)
+    p.add_argument("--max_grad_norm",      type=float, default=1.0)
+    p.add_argument("--warmup_frac",        type=float, default=0.5,
+                   help="Fraction of epochs used for linear LR warmup (default 0.5 = 50%%).")
+    p.add_argument("--lr_min_frac",        type=float, default=0.01,
+                   help="LR floor as fraction of peak (default 0.01 = 1%%).")
+    p.add_argument("--alignment_weight",   type=float, default=None,
+                   help="Override config.alignment_loss_weight.")
+    p.add_argument("--extra_data",         action="store_true",
+                   help="Also stream CommonVoice-en and VoxPopuli-en.")
+    p.add_argument("--num_workers",        type=int,   default=4)
+    p.add_argument("--log_every",          type=int,   default=50)
+    p.add_argument("--save_every_epoch",   action="store_true",
+                   help="Save a checkpoint after every epoch (default: only best val).")
+    p.add_argument("--seed",               type=int,   default=42)
+    p.add_argument("--dtype",              default="bfloat16",
+                   choices=["float32", "float16", "bfloat16"])
+    return p.parse_args()
 
-    is_distributed = world_size > 1
-    is_main        = is_main_process()
 
-    log.info(f"Distributed: {is_distributed}  world_size={world_size}  "
-             f"local_rank={local_rank}  device={device}")
+def main():
+    args = parse_args()
 
-    # ── 1. Tokenizer (all ranks load identically) ─────────────────────────────
-    log.info(f"Loading tokenizer: {args.gemma_ckpt}")
-    tokenizer = AutoTokenizer.from_pretrained(args.gemma_ckpt)
-    n_added = tokenizer.add_special_tokens({
-        "additional_special_tokens": [
-            "<|begofcAUDIO|>", "<|cAUDIO|>", "<|endofcAUDIO|>"
-        ]
-    })
-    log.info(f"Added {n_added} audio special tokens")
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype  = {"float32": torch.float32,
+               "float16": torch.float16,
+               "bfloat16": torch.bfloat16}[args.dtype]
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Tokenizer ─────────────────────────────────────────────────────────────
+    tokenizer_name = (args.model_name_or_path
+                      or "Qwen/Qwen2.5-3B-Instruct")
+    print(f"[init] Loading tokenizer from {tokenizer_name} …")
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=True,
+        padding_side="right",
+    )
+    # Add audio special tokens if not already present
+    audio_special_tokens = ["<|begofcAUDIO|>", "<|cAUDIO|>", "<|endofcAUDIO|>"]
+    new_tokens = [t for t in audio_special_tokens if t not in tokenizer.get_vocab()]
+    if new_tokens:
+        tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+        print(f"[init] Added {len(new_tokens)} audio special tokens.")
 
     audio_token_index = tokenizer.convert_tokens_to_ids("<|cAUDIO|>")
-    assert audio_token_index != tokenizer.unk_token_id, \
-        "<|cAUDIO|> resolved to UNK — add_special_tokens failed"
-    log.info(f"<|cAUDIO|> id = {audio_token_index}")
 
-    # ── 2. Build model ────────────────────────────────────────────────────────
-    log.info("Building model...")
-    config = CovoAudioConfig()
-    config.audio_token_index = audio_token_index
-    model  = CovoAudioForCausalLM(config)
+    # ── Model ─────────────────────────────────────────────────────────────────
+    if args.model_name_or_path:
+        print(f"[init] Loading model from {args.model_name_or_path} …")
+        model = CovoAudioForConditionalGeneration.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=dtype,
+        )
+    else:
+        print("[init] Initialising model from default CovoAudioConfig …")
+        config = CovoAudioConfig()
+        model  = CovoAudioForConditionalGeneration(config)
 
-    # Apply small init to adapter's final projection layer
-    # CRITICAL: prevents loss=93 caused by large random adapter outputs
-    last_layer = model.audio_adapter.downsample_layers[-1]
-    # DropoutWrapper hasn't been added yet so access module directly
-    target = last_layer.module if hasattr(last_layer, "module") else last_layer
-    nn.init.normal_(target.linear2.weight, std=0.01)
-    nn.init.zeros_(target.linear2.bias)
-    log.info("Applied small init to adapter final projection layer")
+    # Resize embeddings if tokenizer vocab grew
+    model.language_model.resize_token_embeddings(len(tokenizer))
+    model = model.to(device=device, dtype=dtype)
 
-    # Load pretrained LLM
-    log.info(f"Loading LLM: {args.gemma_ckpt}")
-    llm = Gemma3ForCausalLM.from_pretrained(
-        args.gemma_ckpt,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
+    alignment_weight = (
+        args.alignment_weight
+        if args.alignment_weight is not None
+        else model.config.alignment_loss_weight
     )
-    llm.resize_token_embeddings(len(tokenizer))
-    model.llm = llm
-    del llm
-    torch.cuda.empty_cache()
+    print(f"[init] Alignment loss weight: {alignment_weight}")
 
-    # Load pretrained Whisper encoder
-    log.info(f"Loading encoder: {args.whisper_ckpt}")
-    whisper = WhisperModel.from_pretrained(
-        args.whisper_ckpt,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-    )
-    model.encoder = whisper.encoder
-    del whisper
-    torch.cuda.empty_cache()
-
-    # ── 3. Freeze ─────────────────────────────────────────────────────────────
-    for p in model.llm.parameters():
-        p.requires_grad = False
-    for p in model.encoder.parameters():
-        p.requires_grad = False
-    for p in model.audio_adapter.parameters():
-        p.requires_grad = True
-
-    add_adapter_dropout(model, p=args.adapter_dropout)
+    # ── Freeze strategy (Stage 1: train adapter only) ─────────────────────────
+    # Freeze Whisper encoder and Qwen2 LM; only train the adapter projection.
+    for name, param in model.named_parameters():
+        if "audio_adapter" in name or "adapter" in name.lower():
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
-    log.info(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    print(f"[init] Trainable: {trainable:,} / {total:,} parameters "
+          f"({100*trainable/total:.1f} %)")
 
-    # ── 4. Move to device & wrap in DDP ──────────────────────────────────────
-    model = model.to(device)
-
-    if is_distributed:
-        # find_unused_parameters=True because LLM and encoder params are frozen
-        # and never produce gradients — DDP needs to know this is intentional
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True,
-        )
-        log.info(f"Wrapped in DDP  (find_unused_parameters=True)")
-
-    model.train()
-
-    # Convenience: unwrapped model for audio_encoder calls
-    base_model = model.module if is_distributed else model
-
-    # ── 5. Datasets ───────────────────────────────────────────────────────────
-    log.info("Building streaming train dataset...")
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    print("[data] Building training dataset …")
     train_ds = LibriSpeechStreamingDataset(
         tokenizer=tokenizer,
         audio_token_index=audio_token_index,
         use_extra_data=args.extra_data,
-        shuffle_buffer=args.shuffle_buffer,
         seed=args.seed,
-        max_duration=args.max_duration,
+    )
+    print("[data] Building validation dataset …")
+    val_ds = LibriSpeechValDataset(
+        tokenizer=tokenizer,
+        audio_token_index=audio_token_index,
     )
 
-    collator = AudioTextCollator(
-        pad_token_id=tokenizer.pad_token_id or 0,
-        padding_side="left",
-        max_seq_len=args.max_seq_len,
-    )
-
-    # Streaming datasets don't support DistributedSampler.
-    # Instead each rank gets a different shard of the interleaved stream
-    # by using a rank-offset seed — each process sees different samples.
-    if is_distributed:
-        # Reseed the dataset per rank so each GPU sees different data
-        train_ds_rank = LibriSpeechStreamingDataset(
-            tokenizer=tokenizer,
-            audio_token_index=audio_token_index,
-            use_extra_data=args.extra_data,
-            shuffle_buffer=args.shuffle_buffer,
-            seed=args.seed + local_rank,   # ← different seed per rank
-            max_duration=args.max_duration,
-        )
-    else:
-        train_ds_rank = train_ds
-
+    collator   = AudioSpeechCollator(pad_token_id=tokenizer.pad_token_id or 0)
     train_loader = DataLoader(
-        train_ds_rank,
+        train_ds,
         batch_size=args.batch_size,
         collate_fn=collator,
         num_workers=args.num_workers,
         pin_memory=True,
-        prefetch_factor=2 if args.num_workers > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size * 2,
+        collate_fn=collator,
+        num_workers=2,
+        pin_memory=True,
+        shuffle=False,
     )
 
-    # Validation only on rank 0 to avoid redundant computation
-    val_loader = None
-    if is_main:
-        log.info("Loading validation set (rank 0 only)...")
-        val_ds = LibriSpeechValDataset(
-            tokenizer=tokenizer,
+    # ── Optimizer + epoch-based scheduler ─────────────────────────────────────
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+
+    scheduler = EpochWarmupCosineScheduler(
+        optimizer=optimizer,
+        num_epochs=args.num_epochs,
+        warmup_frac=args.warmup_frac,
+        lr_min_frac=args.lr_min_frac,
+    )
+
+    warmup_end = scheduler.warmup_end
+    print(
+        f"[schedule] {args.num_epochs} epochs total | "
+        f"warmup epochs 0–{warmup_end-1} ({warmup_end}/{args.num_epochs} = "
+        f"{100*warmup_end/args.num_epochs:.0f} %) | "
+        f"cosine decay epochs {warmup_end}–{args.num_epochs-1}"
+    )
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    best_val_loss = float("inf")
+
+    for epoch in range(args.num_epochs):
+        # Update LR at the start of each epoch
+        scheduler.step(epoch)
+        current_lr = scheduler.get_last_lr()[0]
+        print(
+            f"\n{'='*70}\n"
+            f"Epoch {epoch+1}/{args.num_epochs}  |  lr={current_lr:.2e}\n"
+            f"{'='*70}"
+        )
+
+        t0 = time.time()
+        train_metrics = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            grad_accum=args.grad_accum,
+            alignment_weight=alignment_weight,
             audio_token_index=audio_token_index,
-            max_duration=args.max_duration,
+            max_grad_norm=args.max_grad_norm,
+            log_every=args.log_every,
         )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collator,
-            num_workers=0,
+        train_time = time.time() - t0
+
+        print(f"\n[epoch {epoch+1}] train  "
+              f"ce={train_metrics['ce_loss']:.4f}  "
+              f"align={train_metrics['align_loss']:.4f}  "
+              f"total={train_metrics['total_loss']:.4f}  "
+              f"({train_time/60:.1f} min)")
+
+        # ── Validation ────────────────────────────────────────────────────────
+        val_metrics = validate(
+            model=model,
+            loader=val_loader,
+            device=device,
+            alignment_weight=alignment_weight,
+            audio_token_index=audio_token_index,
         )
+        print(f"[epoch {epoch+1}] val    "
+              f"ce={val_metrics['val_ce']:.4f}  "
+              f"align={val_metrics['val_align']:.4f}  "
+              f"total={val_metrics['val_loss']:.4f}")
 
-    # ── 6. Optimizer & scheduler ──────────────────────────────────────────────
-    param_groups = get_adapter_param_groups(base_model, weight_decay=args.weight_decay)
-    optimizer    = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.999), eps=1e-8)
-    scheduler    = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=args.max_steps,
-        pct_start=args.warmup_steps / args.max_steps,
-        anneal_strategy="cos",
-        div_factor=10.0,
-        final_div_factor=100,
-    )
+        # ── Checkpoint ────────────────────────────────────────────────────────
+        if args.save_every_epoch:
+            ckpt_dir = output_dir / f"epoch_{epoch+1:03d}"
+            model.save_pretrained(ckpt_dir)
+            tokenizer.save_pretrained(ckpt_dir)
+            print(f"[ckpt] Saved epoch checkpoint → {ckpt_dir}")
 
-    use_amp = device.type == "cuda"
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+        if val_metrics["val_loss"] < best_val_loss:
+            best_val_loss = val_metrics["val_loss"]
+            best_dir = output_dir / "best"
+            model.save_pretrained(best_dir)
+            tokenizer.save_pretrained(best_dir)
+            print(f"[ckpt] New best val_loss={best_val_loss:.4f} → {best_dir}")
 
-    # ── 7. Training loop ──────────────────────────────────────────────────────
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    best_val_loss    = float("inf")
-    val_loss         = float("inf")
-    patience_counter = 0
-    global_step      = 0
-    running_loss     = 0.0
-    optimizer.zero_grad()
-
-    # Norm debug: enable for first debug_norm_steps steps on rank 0 only
-    debug_norm_steps = args.debug_norm_steps
-
-    log.info(f"\n{'='*60}")
-    log.info(f"  Stage 1 — Adapter Alignment")
-    log.info(f"  GPUs:          {world_size}")
-    log.info(f"  LLM:           Gemma 3 4B IT")
-    log.info(f"  Encoder:       Whisper Medium")
-    log.info(f"  max_steps:     {args.max_steps:,}")
-    log.info(f"  batch/GPU:     {args.batch_size}")
-    log.info(f"  grad_accum:    {args.grad_accum}")
-    log.info(f"  effective_bs:  {args.batch_size * args.grad_accum * world_size}")
-    log.info(f"  lr:            {args.lr}")
-    log.info(f"  warmup_steps:  {args.warmup_steps}")
-    log.info(f"  weight_decay:  {args.weight_decay}")
-    log.info(f"  label_smooth:  {args.label_smoothing}")
-    log.info(f"  adapter_drop:  {args.adapter_dropout}")
-    log.info(f"  debug_norms:   first {debug_norm_steps} steps")
-    log.info(f"{'='*60}\n")
-
-    progress = tqdm(
-        total=args.max_steps,
-        desc="Stage 1",
-        unit="step",
-        disable=not is_main,
-        dynamic_ncols=True,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
-    )
-
-    for micro_step, batch in enumerate(train_loader):
-        if global_step >= args.max_steps:
-            break
-
-        input_ids      = batch["input_ids"].to(device)
-        labels         = batch["labels"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-
-        # Norm debug active for the first N optimizer steps on rank 0 only
-        do_debug = is_main and (global_step < debug_norm_steps)
-
-        # ── Forward ───────────────────────────────────────────────────────────
-        with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
-            inputs_embeds = inject_audio(
-                base_model, model, batch["wavs"],
-                input_ids, audio_token_index,
-                log, debug_norms=do_debug,
-            )
-            outputs = model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-            )
-            loss = compute_loss(
-                outputs.logits, labels,
-                label_smoothing=args.label_smoothing,
-            )
-            loss = loss / args.grad_accum
-
-        # ── Backward ──────────────────────────────────────────────────────────
-        scaler.scale(loss).backward()
-        running_loss += loss.item() * args.grad_accum
-
-        # ── Optimizer step ────────────────────────────────────────────────────
-        if (micro_step + 1) % args.grad_accum == 0:
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for pg in param_groups for p in pg["params"]],
-                max_norm=args.clip_grad,
-            )
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad()
-            global_step += 1
-
-            # ── Progress bar ──────────────────────────────────────────────────
-            if is_main:
-                avg_loss = running_loss / min(global_step, args.log_every)
-                lr_now   = optimizer.param_groups[0]["lr"]
-                progress.update(1)
-                progress.set_postfix(
-                    loss=f"{loss.item() * args.grad_accum:.4f}",
-                    avg=f"{avg_loss:.4f}",
-                    grad=f"{grad_norm:.2f}",
-                    lr=f"{lr_now:.1e}",
-                    val=f"{best_val_loss:.4f}" if best_val_loss < float("inf") else "n/a",
-                )
-
-            # ── Logging ───────────────────────────────────────────────────────
-            if is_main and global_step % args.log_every == 0:
-                avg_loss = running_loss / args.log_every
-                running_loss = 0.0
-                log.info(
-                    f"step {global_step:6d}/{args.max_steps}  "
-                    f"loss={loss.item() * args.grad_accum:.4f}  "
-                    f"avg={avg_loss:.4f}  "
-                    f"grad={grad_norm:.2f}  "
-                    f"lr={lr_now:.2e}  "
-                    f"gpu={local_rank}"
-                )
-
-            # ── Validation (rank 0 only) ───────────────────────────────────────
-            if global_step % args.eval_every == 0 and is_main:
-                progress.set_description("Evaluating")
-                val_loss = evaluate(
-                    model, val_loader, audio_token_index,
-                    device, args.max_val_batches, log,
-                )
-                progress.set_description("Stage 1")
-                log.info(
-                    f"\n{'─'*50}\n"
-                    f"  EVAL  step={global_step}  "
-                    f"val_loss={val_loss:.4f}  "
-                    f"best={best_val_loss:.4f}\n"
-                    f"{'─'*50}"
-                )
-                if val_loss < best_val_loss:
-                    best_val_loss    = val_loss
-                    patience_counter = 0
-                    save_checkpoint(model, tokenizer, args.output_dir,
-                                    "best", global_step, val_loss, log)
-                else:
-                    patience_counter += 1
-                    log.info(f"  No improvement. "
-                             f"Patience: {patience_counter}/{args.patience}")
-                    if patience_counter >= args.patience:
-                        log.info(f"\nEarly stopping at step {global_step}")
-                        break
-
-            # ── Periodic save ─────────────────────────────────────────────────
-            if global_step % args.save_every == 0:
-                save_checkpoint(model, tokenizer, args.output_dir,
-                                f"step{global_step}", global_step, val_loss, log)
-
-        # Sync all ranks before next step
-        barrier()
-
-    # ── Final save ────────────────────────────────────────────────────────────
-    progress.close()
-    save_checkpoint(model, tokenizer, args.output_dir,
-                    "final", global_step, best_val_loss, log)
-    log.info(f"\nDone. Best val loss: {best_val_loss:.4f}")
-    log.info(f"Checkpoints: {args.output_dir}")
-
-    if is_distributed:
-        dist.destroy_process_group()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Stage 1: Adapter alignment — torchrun multi-GPU"
-    )
-    p.add_argument("--gemma_ckpt",   default="google/gemma-3-4b-it")
-    p.add_argument("--whisper_ckpt", default="openai/whisper-medium")
-    p.add_argument("--output_dir",   default="checkpoints/stage1")
-
-    p.add_argument("--extra_data",     action="store_true")
-    p.add_argument("--shuffle_buffer", type=int,   default=1000)
-    p.add_argument("--max_duration",   type=float, default=20.0)
-    p.add_argument("--max_seq_len",    type=int,   default=2048)
-    p.add_argument("--num_workers",    type=int,   default=2)
-
-    p.add_argument("--max_steps",       type=int,   default=200000)
-    p.add_argument("--batch_size",      type=int,   default=4)
-    p.add_argument("--grad_accum",      type=int,   default=8)
-    p.add_argument("--lr",              type=float, default=3e-4)
-    p.add_argument("--warmup_steps",    type=int,   default=2000)
-    p.add_argument("--weight_decay",    type=float, default=0.01)
-    p.add_argument("--clip_grad",       type=float, default=1.0)
-    p.add_argument("--label_smoothing", type=float, default=0.1)
-    p.add_argument("--adapter_dropout", type=float, default=0.1)
-    p.add_argument("--seed",            type=int,   default=42)
-
-    p.add_argument("--eval_every",      type=int, default=2000)
-    p.add_argument("--save_every",      type=int, default=5000)
-    p.add_argument("--log_every",       type=int, default=100)
-    p.add_argument("--max_val_batches", type=int, default=200)
-    p.add_argument("--patience",        type=int, default=5)
-
-    # Norm debugging: logs audio vs text embedding magnitudes for first N steps
-    # Set to 0 to disable. Use 5-10 to diagnose loss=93 issues.
-    p.add_argument("--debug_norm_steps", type=int, default=5,
-                   help="Log audio/text embedding norms for first N optimizer steps")
-
-    return p.parse_args()
+    # ── Final checkpoint ──────────────────────────────────────────────────────
+    final_dir = output_dir / "final"
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    print(f"\n[done] Final model saved → {final_dir}")
+    print(f"[done] Best val_loss={best_val_loss:.4f} → {output_dir/'best'}")
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    main()
