@@ -36,13 +36,16 @@ Labels: -100 for all prompt tokens; transcript + <|im_end|> token ids supervised
 """
 
 import os
+os.environ["HF_DATASETS_CACHE"]     = "/workspace/hf_cache"
+os.environ["HF_HOME"]               = "/workspace/hf_home"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "/workspace/hf_hub"
+
 import torch
 import numpy as np
 import torchaudio.functional as AF
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, Dataset
 from datasets import load_dataset, interleave_datasets
-
 
 
 def calc_seq_len(seq_len: int, adapter_downsample: int = 8) -> int:
@@ -139,9 +142,19 @@ def build_sample(
         labels         long tensor     (T_seq,)  — prompt masked with -100
         attention_mask long tensor     (T_seq,)  — all ones
     """
-    # Number of <|cAUDIO|> placeholder tokens for this waveform
-    duration_frames  = len(wav) * 100 // 24_000
-    num_audio_tokens = calc_seq_len(duration_frames, adapter_downsample=adapter_downsample)
+    # Number of <|cAUDIO|> placeholder tokens for this waveform.
+    #
+    # MUST be a FIXED constant, not duration-derived: audio_encoder() always
+    # pads/trims every clip to a fixed 30s window (pad_or_trim -> N_SAMPLES)
+    # before running Whisper, so the encoder always outputs 1500 frames and
+    # the adapter always outputs calc_seq_len(1500, adapter_downsample)
+    # vectors — regardless of how long the actual speech in `wav` is. Using
+    # the real clip duration here (as a previous version of this function
+    # did) produces a placeholder count that doesn't match what the adapter
+    # actually emits for any clip shorter than 30s, which is the cause of
+    # the "[build_inputs_embeds] placeholder/feature count mismatch"
+    # warning seen at runtime.
+    num_audio_tokens = calc_seq_len(1500, adapter_downsample=adapter_downsample)
 
     audio_placeholder = (
         "<|begofcAUDIO|>"
