@@ -104,7 +104,7 @@ class DownsampleLayer(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim=None):
         super().__init__()
         if hidden_dim is None:
-            hidden_dim = max(input_dim, output_dim)
+            hidden_dim = 1024
         self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=input_dim, kernel_size=3, stride=2, padding=1)
         self.linear1 = nn.Linear(input_dim, hidden_dim)
         self.relu1 = nn.ReLU()
