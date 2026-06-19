@@ -36,10 +36,6 @@ Labels: -100 for all prompt tokens; transcript + <|im_end|> token ids supervised
 """
 
 import os
-os.environ["HF_DATASETS_CACHE"]     = "/workspace/hf_cache"
-os.environ["HF_HOME"]               = "/workspace/hf_home"
-os.environ["HUGGINGFACE_HUB_CACHE"] = "/workspace/hf_hub"
-
 import torch
 import numpy as np
 import torchaudio.functional as AF
@@ -48,13 +44,17 @@ from torch.utils.data import IterableDataset, Dataset
 from datasets import load_dataset, interleave_datasets
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Token-sequence length  (mirrors calc_seq_len in modeling_covo_audio.py)
-# ─────────────────────────────────────────────────────────────────────────────
 
-def calc_seq_len(seq_len: int) -> int:
-    """Frames after the 4-stage conv stack, each stage stride=2."""
-    for _ in range(4):
+def calc_seq_len(seq_len: int, adapter_downsample: int = 8) -> int:
+    """
+    Frames after AudioAdapter's downsampling conv stack.
+
+    num_layers = adapter_downsample.bit_length() - 1, matching AudioAdapter's
+    own layer-count formula exactly (see modeling_covo_audio.py:AudioAdapter).
+    For adapter_downsample=8 → 3 stride-2 stages → 8x downsampling.
+    """
+    num_layers = adapter_downsample.bit_length() - 1
+    for _ in range(num_layers):
         seq_len = (seq_len + 1) // 2
     return seq_len
 
@@ -105,11 +105,12 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 def build_sample(
-    wav:               torch.Tensor,
-    transcript:        str,
+    wav:                 torch.Tensor,
+    transcript:          str,
     tokenizer,
-    audio_token_index: int,
-    system_prompt:     str = DEFAULT_SYSTEM_PROMPT,
+    audio_token_index:   int,
+    system_prompt:       str = DEFAULT_SYSTEM_PROMPT,
+    adapter_downsample:  int = 8,
 ) -> dict:
     """
     Build a tokenised training sample.
@@ -124,6 +125,12 @@ def build_sample(
 
     Labels: -100 on all prompt positions; token-ids on response positions.
 
+    adapter_downsample MUST match config.adapter_downsample (default 8) so
+    that the number of <|cAUDIO|> placeholders inserted here exactly equals
+    the number of feature vectors AudioAdapter will actually produce. A
+    mismatch here silently truncates real audio features in training (see
+    calc_seq_len's docstring for the bug this previously caused).
+
     Returns
     -------
     dict with keys:
@@ -134,7 +141,7 @@ def build_sample(
     """
     # Number of <|cAUDIO|> placeholder tokens for this waveform
     duration_frames  = len(wav) * 100 // 24_000
-    num_audio_tokens = calc_seq_len(duration_frames)
+    num_audio_tokens = calc_seq_len(duration_frames, adapter_downsample=adapter_downsample)
 
     audio_placeholder = (
         "<|begofcAUDIO|>"
@@ -184,6 +191,10 @@ class LibriSpeechStreamingDataset(IterableDataset):
         max_duration:       Drop samples longer than this (seconds).
         min_duration:       Drop samples shorter than this (seconds).
         system_prompt:      System message for each ChatML turn.
+        adapter_downsample: MUST match config.adapter_downsample. Controls
+                            how many <|cAUDIO|> placeholders are inserted per
+                            clip — mismatching this silently truncates real
+                            adapter output during training.
     """
 
     LIBRISPEECH_SPLITS = [
@@ -199,23 +210,25 @@ class LibriSpeechStreamingDataset(IterableDataset):
     def __init__(
         self,
         tokenizer,
-        audio_token_index: int,
-        use_extra_data:    bool  = False,
-        shuffle_buffer:    int   = 1_000,
-        seed:              int   = 42,
-        max_duration:      float = 20.0,
-        min_duration:      float = 1.0,
-        system_prompt:     str   = DEFAULT_SYSTEM_PROMPT,
+        audio_token_index:  int,
+        use_extra_data:     bool  = False,
+        shuffle_buffer:     int   = 1_000,
+        seed:               int   = 42,
+        max_duration:       float = 20.0,
+        min_duration:       float = 1.0,
+        system_prompt:      str   = DEFAULT_SYSTEM_PROMPT,
+        adapter_downsample: int   = 8,
     ):
-        self.tokenizer         = tokenizer
-        self.audio_token_index = audio_token_index
-        self.use_extra_data    = use_extra_data
-        self.shuffle_buffer    = shuffle_buffer
-        self.seed              = seed
-        self.max_duration      = max_duration
-        self.min_duration      = min_duration
-        self.system_prompt     = system_prompt
-        self._dataset          = self._build_interleaved()
+        self.tokenizer          = tokenizer
+        self.audio_token_index  = audio_token_index
+        self.use_extra_data     = use_extra_data
+        self.shuffle_buffer     = shuffle_buffer
+        self.seed               = seed
+        self.max_duration       = max_duration
+        self.min_duration       = min_duration
+        self.system_prompt      = system_prompt
+        self.adapter_downsample = adapter_downsample
+        self._dataset           = self._build_interleaved()
 
     def _load_split(self, dataset_id: str, config: str, split: str):
         ds = load_dataset(
@@ -228,6 +241,7 @@ class LibriSpeechStreamingDataset(IterableDataset):
     def _build_interleaved(self):
         splits     = list(self.LIBRISPEECH_SPLITS)
         ls_weights = [100, 360, 500]
+
 
         if self.use_extra_data:
             splits     += list(self.EXTRA_SPLITS)
@@ -286,6 +300,7 @@ class LibriSpeechStreamingDataset(IterableDataset):
                 wav, transcript,
                 self.tokenizer, self.audio_token_index,
                 system_prompt=self.system_prompt,
+                adapter_downsample=self.adapter_downsample,
             )
 
 
@@ -303,13 +318,15 @@ class LibriSpeechValDataset(Dataset):
     def __init__(
         self,
         tokenizer,
-        audio_token_index: int,
-        max_duration:  float = 20.0,
-        system_prompt: str   = DEFAULT_SYSTEM_PROMPT,
+        audio_token_index:  int,
+        max_duration:       float = 20.0,
+        system_prompt:      str   = DEFAULT_SYSTEM_PROMPT,
+        adapter_downsample: int   = 8,
     ):
-        self.tokenizer         = tokenizer
-        self.audio_token_index = audio_token_index
-        self.system_prompt     = system_prompt
+        self.tokenizer          = tokenizer
+        self.audio_token_index  = audio_token_index
+        self.system_prompt      = system_prompt
+        self.adapter_downsample = adapter_downsample
 
         print("[ValDataset] Loading librispeech_asr validation.clean …")
         raw = load_dataset(
@@ -346,4 +363,5 @@ class LibriSpeechValDataset(Dataset):
             wav, transcript,
             self.tokenizer, self.audio_token_index,
             system_prompt=self.system_prompt,
+            adapter_downsample=self.adapter_downsample,
         )
