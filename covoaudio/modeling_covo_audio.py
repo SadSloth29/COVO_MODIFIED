@@ -101,8 +101,10 @@ class DownsampleLayer(nn.Module):
     """
     Downsample layer with 1D convolution and linear layers.
     """
-    def __init__(self, input_dim, output_dim, hidden_dim=2048):
+    def __init__(self, input_dim, output_dim, hidden_dim=None):
         super().__init__()
+        if hidden_dim is None:
+            hidden_dim = max(input_dim, output_dim)
         self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=input_dim, kernel_size=3, stride=2, padding=1)
         self.linear1 = nn.Linear(input_dim, hidden_dim)
         self.relu1 = nn.ReLU()
@@ -142,7 +144,7 @@ class AudioAdapter(nn.Module):
         for i in range(num_layers):
             is_last = (i == num_layers - 1)
             out_dim = output_dim if is_last else input_dim
-            layers.append(DownsampleLayer(in_dim, out_dim))
+            layers.append(DownsampleLayer(in_dim, out_dim, hidden_dim=None))
             in_dim = out_dim  
 
         self.downsample_layers = nn.ModuleList(layers)
@@ -362,7 +364,7 @@ class CovoAudioForCausalLM(PreTrainedModel, GenerationMixin):
         
         if is_first_iteration:      # First generation step, include audio processing
             inputs_embeds = self.llm.get_input_embeddings()(input_ids)
-            cAUDIO_id = kwargs.get(\"cAUDIO_id\", self.config.audio_token_index) 
+            cAUDIO_id = kwargs.get("cAUDIO_id", self.config.audio_token_index)
             audio_features = self.audio_encoder(wavs, inputs_embeds.device)
             feature_lengths = (input_ids == cAUDIO_id).sum(1)
             feature_seq_mask = sequence_mask(feature_lengths, max_len=audio_features.size(1), dtype=torch.bool)
