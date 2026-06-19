@@ -97,29 +97,70 @@ def calc_seq_len(seq_len):
     return seq_len
 
 
-class DownsampleLayer(nn.Module):
-    """
-    Downsample layer with 1D convolution and linear layers.
-    """
-    def __init__(self, input_dim, output_dim, hidden_dim=None):
-        super().__init__()
-        if hidden_dim is None:
-            hidden_dim = 1024
-        self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=input_dim, kernel_size=3, stride=2, padding=1)
-        self.linear1 = nn.Linear(input_dim, hidden_dim)
-        self.relu1 = nn.ReLU()
-        self.linear2 = nn.Linear(hidden_dim, output_dim)
-        self.relu2 = nn.ReLU()
+# class DownsampleLayer(nn.Module):
+#     """
+#     Downsample layer with 1D convolution and linear layers.
+#     """
+#     def __init__(self, input_dim, output_dim, hidden_dim=None):
+#         super().__init__()
+#         if hidden_dim is None:
+#             hidden_dim = 1024
+#         self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=input_dim, kernel_size=3, stride=2, padding=1)
+#         self.linear1 = nn.Linear(input_dim, hidden_dim)
+#         self.relu1 = nn.ReLU()
+#         self.linear2 = nn.Linear(hidden_dim, output_dim)
+#         self.relu2 = nn.ReLU()
     
+#     def forward(self, x):
+#         # x: (B, T, C)
+#         x = x.transpose(1, 2)  # -> (B, C, T)
+#         x = self.conv1d(x)     # -> (B, C, T // 2)
+#         x = x.transpose(1, 2)  # -> (B, T // 2, C)
+#         x = self.relu1(x)
+#         x = self.linear1(x)    # -> (B, T // 2, hidden_dim)
+#         x = self.relu2(x)
+#         x = self.linear2(x)    # -> (B, T // 2, output_dim)
+#         return x
+
+class DownsampleLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=2048):
+        super().__init__()
+
+        self.conv1d = nn.Conv1d(
+            input_dim,
+            input_dim,
+            kernel_size=3,
+            stride=2,
+            padding=1
+        )
+
+        self.norm = nn.LayerNorm(input_dim)
+
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, output_dim)
+
+        self.act = nn.GELU()
+
+        self.use_residual = (input_dim == output_dim)
+
     def forward(self, x):
-        # x: (B, T, C)
-        x = x.transpose(1, 2)  # -> (B, C, T)
-        x = self.conv1d(x)     # -> (B, C, T // 2)
-        x = x.transpose(1, 2)  # -> (B, T // 2, C)
-        x = self.relu1(x)
-        x = self.linear1(x)    # -> (B, T // 2, hidden_dim)
-        x = self.relu2(x)
-        x = self.linear2(x)    # -> (B, T // 2, output_dim)
+
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)
+        x = x.transpose(1, 2)
+
+        residual = x
+
+        x = self.norm(x)
+
+        x = self.linear1(x)
+        x = self.act(x)
+
+        x = self.linear2(x)
+
+        if self.use_residual:
+            x = x + residual
+
         return x
 
 
