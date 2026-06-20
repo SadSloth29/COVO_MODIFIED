@@ -466,38 +466,40 @@ def main():
     
     # ── Model ─────────────────────────────────────────────────────────────────
     if args.model_name_or_path:
-        # Load pretrained base models
+        
         base_llm = Qwen2ForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=dtype)
         base_whisper = WhisperForConditionalGeneration.from_pretrained(
             "openai/whisper-small", torch_dtype=dtype
         )
     
+
+        target_vocab_size = audio_token_index + 16384
         
+        
+        base_llm.resize_token_embeddings(target_vocab_size, mean_resizing=True)
+        
+    
         covo_config = CovoAudioConfig(
             llm_config=base_llm.config,
             encoder_config=base_whisper.config,   
             audio_token_index=audio_token_index,
-            adapter_downsample=CovoAudioConfig.adapter_downsample,  # default 8
+            adapter_downsample=8,  
         )
+        
+        
         model = CovoAudioForCausalLM(covo_config)
     
-    
+
         model.llm.load_state_dict(base_llm.state_dict(), strict=False)
-    
-       
         model.audio_encoder.load_state_dict(base_whisper.state_dict(), strict=False)
-    
         
-        final_vocab_size = covo_config.vocab_size
-        model.llm.resize_token_embeddings(final_vocab_size, mean_resizing=True)
+        print(f"[init] Loaded pretrained base LLM and Whisper. Model vocabulary size: {covo_config.llm_config.vocab_size}")
     
     else:
-        # No pretrained weights – use default config (already has expanded vocab)
+        
         model = CovoAudioForCausalLM(CovoAudioConfig(audio_token_index=audio_token_index))
     
-    
     model = model.to(device=device, dtype=dtype)
-
     # ── Freeze: only audio_adapter is trainable ───────────────────────────────
     for name, param in model.named_parameters():
         param.requires_grad = name.startswith("audio_adapter.")
