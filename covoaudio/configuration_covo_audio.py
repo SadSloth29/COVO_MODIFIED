@@ -1,24 +1,55 @@
 """
 CovoAudioConfig — Qwen2.5-3B-Instruct + Whisper-Small backbone.
 
-Design notes
-────────────
-• LLM   : Qwen2 (transformers >= 4.37, Qwen2Config / Qwen2ForCausalLM)
-• Encoder: Whisper Small  (80-mel, d_model=768)
-• audio_token_index = 151936  — first slot past the standard Qwen2.5 vocab
-• adapter_downsample = 8      — 4 × DownsampleLayer(stride=2) → 16× temporal
-                                compression of 100-Hz Whisper frames
-• alignment_loss_weight       — λ for the cosine-embedding alignment term
-                                added on top of the cross-entropy ASR loss.
-                                Set to 0.0 to disable; 0.1 is a safe default.
+This is a deliberate DOWNSIZE of the original production config
+(Qwen2-7B-Instruct + Whisper-Large-V3). The reference 7B/Large-V3 config was
+provided as the baseline being scaled down from, not the target — this file
+targets 3B/Small specifically.
+
+What scales down vs what carries over unchanged
+─────────────────────────────────────────────────
+SCALES DOWN (architecture-size-specific dimensions):
+  llm hidden_size          3584 → 2048
+  llm intermediate_size    18944 → 11008
+  llm num_hidden_layers    28 → 36     (3B is narrower but deeper than 7B)
+  llm num_attention_heads  28 → 16
+  llm num_key_value_heads  4 → 2
+  whisper d_model          1280 → 768  (Large-V3 → Small)
+  whisper num_mel_bins     128 → 80
+  whisper encoder_layers   32 → 12
+  whisper encoder_attention_heads  20 → 12
+  whisper encoder_ffn_dim  5120 → 3072
+
+CARRIES OVER UNCHANGED (protocol-level, not size-dependent):
+  • The +16384 audio-codec vocab reservation. This range exists because the
+    full model (a2ta mode) generates audio codec tokens interleaved with
+    text, decoded by a separate vocoder (token2wav). The codec's token
+    count (16384) is a property of that vocoder/speech-tokenizer, not of
+    the LLM backbone size — it doesn't shrink just because the LLM did.
+  • audio_token_index = base_vocab_size of whichever LLM you use, so that
+    vocab_size = audio_token_index + 16384 still holds:
+        Qwen2.5-3B-Instruct base vocab_size = 151936
+        audio_token_index                  = 151936
+        vocab_size                         = 151936 + 16384 = 168320
+  • EOS-token-by-mode convention (a2t vs a2ta) — see note below. This is a
+    decoding protocol choice, independent of model size.
+
+eos_token_id note
+───────────────────
+bos_token_id == eos_token_id == 151643 (<|endoftext|>) for the base LLM
+config, matching Qwen2.5's convention. The inference server selects the
+ACTUAL stop token by generation mode at generate()-call time, not from this
+config field:
+    a2ta (interleaved audio+text chat): eos_token_id = <|im_end|>  (151645)
+    a2t  (audio→text, i.e. ASR — what we train here): eos_token_id = <|endoftext|> (151643)
+Training labels for ASR (a2t) must terminate with <|endoftext|>, matching
+this config's eos_token_id — see dataset.py's build_sample().
 
 n_mels note
 ───────────
-The WhisperConfig below uses num_mel_bins=80 (Whisper Small pretrained weights).
-However modeling_covo_audio.py calls log_mel_spectrogram(..., n_mels=128).
-These must agree or the conv1 weights will be mismatched when loading a
-pretrained encoder.  The fix is applied in modeling_covo_audio.py (change to
-n_mels=80) AND here num_mel_bins=80 is kept as the canonical value.
+Whisper Small uses num_mel_bins=80. modeling_covo_audio.py's audio_encoder()
+must call log_mel_spectrogram(audio, n_mels=80) to match — keep these two in
+sync for whichever Whisper size is actually used.
 """
 from typing import Optional
 from transformers import WhisperConfig, PretrainedConfig
@@ -40,11 +71,10 @@ class CovoAudioConfig(PretrainedConfig):
 
     def __init__(
         self,
-        llm_config:            Optional[LLMConfig]    = None,
-        encoder_config:        Optional[WhisperConfig] = None,
-        audio_token_index:     int   = 151936,
-        adapter_downsample:    int   = 8,
-        alignment_loss_weight: float = 0.1,
+        llm_config:         Optional[LLMConfig]    = None,
+        encoder_config:     Optional[WhisperConfig] = None,
+        audio_token_index:  int   = 151936,   # = Qwen2.5-3B-Instruct base vocab_size
+        adapter_downsample: int   = 8,
         **kwargs,
     ):
         # ── Qwen 2.5 3B Instruct ─────────────────────────────────────────────
@@ -53,34 +83,41 @@ class CovoAudioConfig(PretrainedConfig):
                 architectures=["Qwen2ForCausalLM"],
                 model_type="qwen2",
 
-                vocab_size=151936,
+                # base vocab (151936) + 16384 reserved audio-codec tokens.
+                # See module docstring — this offset carries over from the
+                # original 7B config's protocol, scaled to the 3B base vocab.
+                vocab_size=151936 + 16384,   # = 168320
 
                 hidden_size=2048,
                 intermediate_size=11008,
                 num_hidden_layers=36,
                 num_attention_heads=16,
                 num_key_value_heads=2,
-                head_dim=128,
+                head_dim=128,            # hidden_size // num_attention_heads
+                max_window_layers=36,
 
                 hidden_act="silu",
 
                 max_position_embeddings=32768,
                 rope_theta=1000000.0,
                 rope_scaling=None,
+                sliding_window=32768,
+                use_sliding_window=False,
 
                 attention_dropout=0.0,
                 rms_norm_eps=1e-6,
                 initializer_range=0.02,
 
-                # Qwen2.5 special tokens:
-                #   <|endoftext|>  = 151643
-                #   <|im_start|>   = 151644
-                #   <|im_end|>     = 151645  ← chat EOS
+                # <|endoftext|> = 151643 for both bos and eos (Qwen2.5
+                # convention). a2ta mode overrides eos at generate()-call
+                # time with <|im_end|> (151645) — not baked in here, since
+                # the same checkpoint serves both a2t and a2ta depending on
+                # how it's invoked.
                 bos_token_id=151643,
-                eos_token_id=151645,
-                pad_token_id=151643,
+                eos_token_id=151643,
 
                 use_cache=True,
+                use_mrope=False,
                 tie_word_embeddings=False,
                 torch_dtype="bfloat16",
             )
@@ -94,9 +131,9 @@ class CovoAudioConfig(PretrainedConfig):
 
                 vocab_size=51865,
 
-                # 80 mel bins — Whisper Small pretrained weights.
-                # modeling_covo_audio.py must also use n_mels=80 here.
-                # DO NOT change to 128 (Large-V3 only).
+                # 80 mel bins — Whisper Small. audio_encoder() in
+                # modeling_covo_audio.py must call log_mel_spectrogram with
+                # n_mels=80 to match. DO NOT use 128 here (Large-V3 only).
                 num_mel_bins=80,
 
                 d_model=768,
@@ -144,13 +181,12 @@ class CovoAudioConfig(PretrainedConfig):
                 num_hidden_layers=12,
             )
 
-        self.audio_token_index     = audio_token_index
-        self.adapter_downsample    = adapter_downsample
-        self.alignment_loss_weight = alignment_loss_weight
-        self.llm_config            = llm_config
-        self.encoder_config        = encoder_config
+        self.audio_token_index  = audio_token_index
+        self.adapter_downsample = adapter_downsample
+        self.llm_config         = llm_config
+        self.encoder_config     = encoder_config
 
-        # Derived dimensions — used by the trainer and the adapter
+        # Derived dimensions
         self.whisper_feats_dim = encoder_config.d_model      # 768
         self.llm_hidden_size   = llm_config.hidden_size      # 2048
 
