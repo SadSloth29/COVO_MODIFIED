@@ -462,18 +462,39 @@ def main():
     print(f"[init] <|im_end|>      id = {tokenizer.convert_tokens_to_ids('<|im_end|>')}  "
           f"(a2ta stop token — NOT used to terminate ASR training labels)")
 
+    
     # ── Model ─────────────────────────────────────────────────────────────────
     if args.model_name_or_path:
+        # Load pretrained base models
+        base_llm = Qwen2ForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=dtype)
+        base_whisper = WhisperForConditionalGeneration.from_pretrained(
+            "openai/whisper-small", torch_dtype=dtype
+        )
+    
         
-        model = CovoAudioForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=dtype)
-    else:
+        covo_config = CovoAudioConfig(
+            llm_config=base_llm.config,
+            encoder_config=base_whisper.config,   
+            audio_token_index=audio_token_index,
+            adapter_downsample=CovoAudioConfig.adapter_downsample,  # default 8
+        )
+        model = CovoAudioForCausalLM(covo_config)
+    
+    
+        model.llm.load_state_dict(base_llm.state_dict(), strict=False)
+    
        
-        print(f"[init] model ← CovoAudioConfig(audio_token_index={audio_token_index}) "
-              f"(no pretrained LLM weights)")
+        model.audio_encoder.load_state_dict(base_whisper.state_dict(), strict=False)
+    
+        
+        final_vocab_size = covo_config.vocab_size
+        model.llm.resize_token_embeddings(final_vocab_size, mean_resizing=True)
+    
+    else:
+        # No pretrained weights – use default config (already has expanded vocab)
         model = CovoAudioForCausalLM(CovoAudioConfig(audio_token_index=audio_token_index))
-
-   
-    model.llm.resize_token_embeddings(len(tokenizer), mean_resizing=True)
+    
+    
     model = model.to(device=device, dtype=dtype)
 
     # ── Freeze: only audio_adapter is trainable ───────────────────────────────
