@@ -3,7 +3,6 @@ Stage 1 Adapter Training — CovoAudioForCausalLM (Qwen2.5-3B + Whisper-Small)
 ==============================================================================
 
 Loss: standard ASR cross-entropy only.
-
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from covoaudio.configuration_covo_audio import CovoAudioConfig
 from covoaudio.modeling_covo_audio import CovoAudioForCausalLM, sequence_mask
@@ -443,8 +442,20 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
+    # Targets the downsized 3B config: Qwen2.5-3B-Instruct base vocab (151936),
+    # with config.audio_token_index=151936 sitting exactly at that boundary so
+    # vocab_size = audio_token_index + 16384 still holds at this smaller scale.
     tok_src   = args.model_name_or_path or "Qwen/Qwen2.5-3B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True, padding_side="right")
+
+    # config.audio_token_index (151936) is a FIXED, pre-agreed id — it is
+    # also the start of the 16384-slot reserved audio-codec range
+    # (vocab_size = audio_token_index + 16384). <|cAUDIO|> MUST land exactly
+    # at this id, not wherever add_special_tokens() happens to append it,
+    # or every audio placeholder position in build_inputs_embeds() will
+    # silently scatter into the wrong embedding rows.
+    cfg_for_tokens = CovoAudioConfig()   # only used to read the canonical id
+    expected_audio_token_index = cfg_for_tokens.audio_token_index
 
     audio_specials = ["<|begofcAUDIO|>", "<|cAUDIO|>", "<|endofcAUDIO|>"]
     new_toks = [t for t in audio_specials if t not in tokenizer.get_vocab()]
@@ -453,10 +464,28 @@ def main():
         print(f"[init] added {len(new_toks)} audio special tokens → vocab {len(tokenizer)}")
 
     audio_token_index = tokenizer.convert_tokens_to_ids("<|cAUDIO|>")
-    print(f"[init] <|cAUDIO|>      id = {audio_token_index}")
+    print(f"[init] <|cAUDIO|>      id = {audio_token_index}  "
+          f"(expected from config: {expected_audio_token_index})")
     print(f"[init] <|begofcAUDIO|> id = {tokenizer.convert_tokens_to_ids('<|begofcAUDIO|>')}")
     print(f"[init] <|endofcAUDIO|> id = {tokenizer.convert_tokens_to_ids('<|endofcAUDIO|>')}")
-    print(f"[init] <|im_end|>      id = {tokenizer.convert_tokens_to_ids('<|im_end|>')}")
+    print(f"[init] <|endoftext|>   id = {tokenizer.convert_tokens_to_ids('<|endoftext|>')}  "
+          f"(a2t/ASR stop token)")
+    print(f"[init] <|im_end|>      id = {tokenizer.convert_tokens_to_ids('<|im_end|>')}  "
+          f"(a2ta stop token — NOT used to terminate ASR training labels)")
+
+    if audio_token_index != expected_audio_token_index:
+        raise ValueError(
+            f"<|cAUDIO|> landed at tokenizer id {audio_token_index}, but "
+            f"CovoAudioConfig.audio_token_index expects {expected_audio_token_index}. "
+            f"This means add_special_tokens() appended it somewhere else — likely "
+            f"because the loaded tokenizer's base vocab size doesn't match what "
+            f"the config assumes. Audio placeholder scatter in build_inputs_embeds() "
+            f"will silently target the wrong embedding rows if this isn't fixed. "
+            f"Either load a tokenizer whose base vocab already reserves ids up to "
+            f"{expected_audio_token_index}, or explicitly assign these three special "
+            f"tokens to ids [{expected_audio_token_index}, {expected_audio_token_index+1}, "
+            f"{expected_audio_token_index+2}] before training."
+        )
 
     # ── Model ─────────────────────────────────────────────────────────────────
     if args.model_name_or_path:
@@ -465,6 +494,10 @@ def main():
         print("[init] model ← CovoAudioConfig defaults")
         model = CovoAudioForCausalLM(CovoAudioConfig())
 
+    # vocab_size in CovoAudioConfig (151936 + 16384 = 168320) already reserves
+    # the full audio-codec range, so this should be a no-op when the
+    # tokenizer's vocab matches config exactly — kept as a safety net for
+    # tokenizers that don't already include it.
     model.llm.resize_token_embeddings(len(tokenizer))
     model = model.to(device=device, dtype=dtype)
 
