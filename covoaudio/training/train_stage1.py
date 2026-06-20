@@ -491,7 +491,7 @@ def main():
     
 
         model.llm.load_state_dict(base_llm.state_dict(), strict=False)
-        model.audio_encoder.load_state_dict(base_whisper.state_dict(), strict=False)
+        model.encoder.load_state_dict(base_whisper.state_dict(), strict=False)
         
         print(f"[init] Loaded pretrained base LLM and Whisper. Model vocabulary size: {covo_config.llm_config.vocab_size}")
     
