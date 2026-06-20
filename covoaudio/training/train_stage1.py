@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from tqdm import tqdm
+from transformers import AutoTokenizer, Qwen2ForCausalLM, WhisperForConditionalGeneration
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
