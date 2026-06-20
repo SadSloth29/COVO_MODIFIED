@@ -1,6 +1,6 @@
 """
-Streaming Dataset for Stage 1 Adapter Training  (Qwen2 edition)
-================================================================
+Streaming Dataset for Stage 1 Adapter Training  (Qwen2 / a2t-ASR edition)
+==========================================================================
 Sources (all streamed — nothing downloaded upfront):
 
   Primary:
@@ -30,9 +30,16 @@ Prompt format — Qwen2 ChatML  (must match get_dialog_prompt in modeling file)
   <|im_start|>user
   <|begofcAUDIO|><|cAUDIO|>×N<|endofcAUDIO|><|im_end|>
   <|im_start|>assistant
-  {transcript}<|im_end|>
+  {transcript}<|endoftext|>
 
-Labels: -100 for all prompt tokens; transcript + <|im_end|> token ids supervised.
+Labels: -100 for all prompt tokens; transcript + <|endoftext|> token ids
+supervised.
+
+Response terminator is <|endoftext|>, NOT <|im_end|> — this is the a2t
+(audio-to-text, i.e. ASR) generation mode. The covo-audio inference server
+selects eos_token_id by mode: a2ta (interleaved audio+text chat) stops on
+<|im_end|>, but a2t (pure ASR transcription) stops on <|endoftext|>. Training
+data must match the stop token the model will actually be decoded with.
 """
 
 import os
@@ -98,10 +105,6 @@ def preprocess_wav(
     return wav
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sample builder — Qwen2 ChatML
-# ─────────────────────────────────────────────────────────────────────────────
-
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant."
 )
@@ -142,18 +145,7 @@ def build_sample(
         labels         long tensor     (T_seq,)  — prompt masked with -100
         attention_mask long tensor     (T_seq,)  — all ones
     """
-    # Number of <|cAUDIO|> placeholder tokens for this waveform.
-    #
-    # MUST be a FIXED constant, not duration-derived: audio_encoder() always
-    # pads/trims every clip to a fixed 30s window (pad_or_trim -> N_SAMPLES)
-    # before running Whisper, so the encoder always outputs 1500 frames and
-    # the adapter always outputs calc_seq_len(1500, adapter_downsample)
-    # vectors — regardless of how long the actual speech in `wav` is. Using
-    # the real clip duration here (as a previous version of this function
-    # did) produces a placeholder count that doesn't match what the adapter
-    # actually emits for any clip shorter than 30s, which is the cause of
-    # the "[build_inputs_embeds] placeholder/feature count mismatch"
-    # warning seen at runtime.
+  
     num_audio_tokens = calc_seq_len(1500, adapter_downsample=adapter_downsample)
 
     audio_placeholder = (
@@ -162,14 +154,17 @@ def build_sample(
         + "<|endofcAUDIO|>"
     )
 
-    # Build the full ChatML prompt string
+    # Build the full ChatML prompt string.
+    # NOTE: the <|im_end|> tokens here close the system/user ChatML TURNS —
+    # this is correct, unrelated to the response terminator below, and
+    # matches get_dialog_prompt() exactly.
     prompt = (
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
-    # Response — ends with <|im_end|> which is Qwen2's chat EOS (id=151645)
-    response = transcript.strip() + "<|im_end|>"
+    
+    response = transcript.strip() + "<|endoftext|>"
 
     prompt_ids   = tokenizer(prompt,   add_special_tokens=True,  return_tensors="pt").input_ids[0]
     response_ids = tokenizer(response, add_special_tokens=False, return_tensors="pt").input_ids[0]
