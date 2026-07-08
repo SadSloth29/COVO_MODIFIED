@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from covoaudio.configuration_covo_audio import CovoAudioConfig
 from covoaudio.modeling_covo_audio import CovoAudioForCausalLM, sequence_mask
-from covoaudio.training.dataset import (
+from covoaudio.training.dataset_100 import (
     LibriSpeechStreamingDataset,
     LibriSpeechValDataset,
 )
