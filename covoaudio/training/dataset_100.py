@@ -108,7 +108,7 @@ def build_sample(
 # Streaming training dataset – LibriSpeech train.100 only
 # ─────────────────────────────────────────────────────────────────────────────
 
-class LibriSpeech100StreamingDataset(IterableDataset):
+class LibriSpeechStreamingDataset(IterableDataset):
     """
     Streams only the clean 100‑hour subset of LibriSpeech.
 
