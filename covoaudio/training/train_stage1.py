@@ -55,18 +55,46 @@ class AudioSpeechCollator:
             attn_l.append(F.pad(b["attention_mask"], (0, ps), value=0))
             wav_l.append( F.pad(b["wav"],            (0, pw), value=0.0))
 
+        max_transcript = max((b["labels"] >= 0).sum().item() for b in batch)
+        ctc_labels_list, ctc_label_lens = [], []
+        
+        for b in batch:
+            actual = b["labels"][b["labels"] >= 0]   # remove ignored positions
+            ctc_label_lens.append(actual.numel())
+            # Pad to max_transcript with a dummy id (0, but will be masked by length)
+            padded = F.pad(actual, (0, max_transcript - actual.numel()), value=0)
+            ctc_labels_list.append(padded)
+        
         return {
             "input_ids":      torch.stack(ids_l),
             "labels":         torch.stack(lbl_l),
             "attention_mask": torch.stack(attn_l),
             "wav":            torch.stack(wav_l),
+            "ctc_labels":     torch.stack(ctc_labels_list),
+            "ctc_label_lens": torch.tensor(ctc_label_lens),
         }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Diagnostic helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
+def _diag_alignment(model, input_ids, wav, audio_token_index, step: int):
+    """Print placeholder count vs actual audio feature length for first sample."""
+    with torch.no_grad():
+        single_wav = [wav[0]]
+        audio_feats = model.audio_encoder(single_wav, input_ids.device)  # (1, T_a, D)
+        T_a = audio_feats.shape[1]
+        n_placeholders = (input_ids[0] == audio_token_index).sum().item()
+        diff = T_a - n_placeholders
+        print(f"\n  ╔══ [alignment step {step}] first sample ══")
+        print(f"  ║  placeholders: {n_placeholders}")
+        print(f"  ║  audio_feats : {T_a}")
+        print(f"  ║  diff        : {diff}")
+        if diff != 0:
+            print(f"  ║  MISMATCH! Check dataset and adapter_downsample.")
+        print(f"  ╚══")
+        
+        
 def _diag_batch(batch: dict, tokenizer, audio_token_index: int, step: int):
     """Print a human-readable view of the first sample in the batch."""
     ids    = batch["input_ids"][0]
@@ -132,36 +160,45 @@ def _diag_predictions(lm_out, input_ids, labels, tokenizer, step: int):
 # ─────────────────────────────────────────────────────────────────────────────
 # inputs_embeds builder  (differentiable)
 # ─────────────────────────────────────────────────────────────────────────────
+def get_audio_features_batch(model, wav_batch, device):
+    """
+    wav_batch: (B, T_wav) padded waveform
+    Returns:
+        feats: (B, T_a, D) padded
+        feat_lens: (B,) int tensor
+    """
+    B = wav_batch.shape[0]
+    feat_list, lens = [], []
 
+    for i in range(B):
+        # model.audio_encoder expects a list of 1D tensors (no batch dim)
+        w = wav_batch[i]
+        feat = model.audio_encoder([w], device)         # (1, T_a, D)
+        feat = feat.squeeze(0)                          # (T_a, D)
+        feat_list.append(feat)
+        lens.append(feat.shape[0])
+
+    max_t = max(lens)
+    padded = torch.zeros(B, max_t, feat_list[0].shape[-1],
+                         device=device, dtype=feat_list[0].dtype)
+    for i, f in enumerate(feat_list):
+        padded[i, :f.shape[0]] = f
+
+    feat_lens = torch.tensor(lens, device=device)
+    return padded, feat_lens
+    
 def build_inputs_embeds(
     model:             CovoAudioForCausalLM,
     input_ids:         torch.Tensor,   # (B, T)
     wav:               torch.Tensor,   # (B, T_wav)
     audio_token_index: int,
-    _warn_state:       dict = {"warned": False},   # mutable default = one-time latch
 ) -> torch.Tensor:
-    """
-    Build inputs_embeds with audio adapter outputs scattered at <|cAUDIO|>
-    positions. Gradients flow through audio_adapter.
-
-    We clone() the base embeddings before index-assigning so autograd sees a
-    non-leaf output tensor. In-place assignment on the original leaf (the
-    lm_embed output) would silently break grad flow into audio_adapter.
-
-    Mismatch guard: if the adapter emits a different number of feature
-    vectors than there are <|cAUDIO|> placeholders, we trim/pad to make
-    shapes line up — but this previously happened SILENTLY every batch due
-    to a stage-count bug in dataset.py's calc_seq_len (now fixed). A
-    mismatch here should be rare (rounding only); if it's large or constant,
-    dataset.py's adapter_downsample no longer matches
-    model.config.adapter_downsample and needs to be re-synced.
-    """
     device = input_ids.device
     B      = input_ids.shape[0]
 
     lm_embed_fn   = model.llm.get_input_embeddings()
-    base_embeds   = lm_embed_fn(input_ids)        # (B, T, D) — frozen, no grad needed
-    inputs_embeds = base_embeds.clone()            # clone → grad can flow through
+    base_embeds   = lm_embed_fn(input_ids)        # (B, T, D)
+    inputs_embeds = base_embeds.clone()            # clone to allow in-place assignment
 
     for b in range(B):
         single_wav  = [wav[b]]
@@ -171,29 +208,8 @@ def build_inputs_embeds(
         cAUDIO_mask = (input_ids[b] == audio_token_index)      # (T,) bool
         n_pos       = cAUDIO_mask.sum().item()
 
-        if n_pos == 0:
-            continue
-
-        n_feats = audio_feats.shape[0]
-        if n_feats != n_pos and not _warn_state["warned"]:
-            gap = abs(n_feats - n_pos)
-            print(
-                f"\n  ⚠ [build_inputs_embeds] placeholder/feature count mismatch: "
-                f"adapter emits {n_feats} vectors but input_ids has {n_pos} "
-                f"<|cAUDIO|> tokens (gap={gap}). A gap of 0-1 is normal rounding; "
-                f"a large or consistently nonzero gap means dataset.py's "
-                f"adapter_downsample is out of sync with model.config.adapter_downsample "
-                f"— check LibriSpeechStreamingDataset(adapter_downsample=...) matches "
-                f"model.config.adapter_downsample. Truncating/padding to compensate; "
-                f"this warning prints once."
-            )
-            _warn_state["warned"] = True
-
-        if n_feats > n_pos:
-            audio_feats = audio_feats[:n_pos]
-        elif n_feats < n_pos:
-            pad = inputs_embeds.new_zeros(n_pos - n_feats, audio_feats.shape[-1])
-            audio_feats = torch.cat([audio_feats, pad], dim=0)
+       
+        assert n_pos == audio_feats.shape[0], f"Count mismatch: {n_pos} vs {audio_feats.shape[0]}"
 
         inputs_embeds[b][cAUDIO_mask] = audio_feats.to(inputs_embeds.dtype)
 
@@ -266,7 +282,12 @@ class EpochWarmupCosineScheduler:
 # ─────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
+def compute_ctc_weight(epoch, step_in_epoch, steps_per_epoch, warmup_epochs=2.0, final_weight=0.1):
+    """Linearly ramp CTC weight from 0 to final_weight over warmup_epochs."""
+    virtual_epoch = epoch + step_in_epoch / steps_per_epoch
+    return final_weight * min(1.0, max(0.0, virtual_epoch / warmup_epochs))
 
+    
 def train_one_epoch(
     model:             CovoAudioForCausalLM,
     loader:            DataLoader,
@@ -278,6 +299,7 @@ def train_one_epoch(
     grad_accum:        int,
     audio_token_index: int,
     tokenizer,
+    blank_idx,
     max_grad_norm:     float = 1.0,
     log_every:         int   = 50,
     diag_every:        int   = 200,
@@ -287,6 +309,7 @@ def train_one_epoch(
 
     total_ce = 0.0
     steps    = 0
+    opt_step = 0
     optimizer.zero_grad()
 
     pbar = tqdm(
@@ -305,16 +328,37 @@ def train_one_epoch(
         wav            = batch["wav"].to(device)
 
         # ── Step-level LR update — fixes the frozen-LR-per-epoch bug ──────────
-        scheduler.step(epoch, step)
 
         is_diag = (step == 0) or ((step + 1) % diag_every == 0)
         if is_diag:
             _diag_batch(batch, tokenizer, audio_token_index, step + 1)
+            _diag_alignment(model, input_ids, wav, audio_token_index, step + 1)
 
         inputs_embeds = build_inputs_embeds(model, input_ids, wav, audio_token_index)
 
         lm_out  = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
         ce_loss = lm_out.loss
+
+        wav_list = [wav[i] for i in range(wav.shape[0])]   # just a list of 1D tensors
+        ctc_feats , ctc_feats_lens  = get_audio_features_batch(model, wav, device)
+
+        
+        ctc_logits = model.ctc_head(ctc_feats)            # now float32
+        ctc_log_probs = F.log_softmax(ctc_logits, dim=-1)         # still float32
+        
+        ctc_loss_val = F.ctc_loss(
+            ctc_log_probs.float().transpose(0, 1),                        # (T, B, C)
+            batch["ctc_labels"].long(),                           # ensure int64
+            ctc_feats_lens.long(),
+            batch["ctc_label_lens"].long(),
+            blank=blank_idx,
+            reduction="mean",
+            zero_infinity=True,
+        )
+        
+        ctc_weight = compute_ctc_weight(epoch, step, steps_per_epoch_hint,
+                                        warmup_epochs=1.0, final_weight=0.1)
+        combined_loss = ce_loss + ctc_weight * ctc_loss_val
 
         if step == 0:
             print(f"\n  [diag step 1] ce_loss={ce_loss.item():.4f}  "
@@ -324,7 +368,7 @@ def train_one_epoch(
         if is_diag:
             _diag_predictions(lm_out, input_ids, labels, tokenizer, step + 1)
 
-        (ce_loss / grad_accum).backward()
+        (combined_loss / grad_accum).backward()
 
         total_ce += ce_loss.item()
         steps    += 1
@@ -337,10 +381,14 @@ def train_one_epoch(
             optimizer.step()
             optimizer.zero_grad()
 
+            scheduler.step(epoch, opt_step)
+            opt_step += 1
+
         pbar.set_postfix({
-            "ce":  f"{total_ce/steps:.4f}",
-            "lr":  f"{scheduler.get_last_lr()[0]:.2e}",
-        })
+        "ce":  f"{total_ce/steps:.4f}",
+        "ctc": f"{ctc_loss_val.item():.4f}",
+        "lr":  f"{scheduler.get_last_lr()[0]:.2e}",
+    })
 
         if (step + 1) % log_every == 0:
             print(
@@ -356,6 +404,8 @@ def train_one_epoch(
         )
         optimizer.step()
         optimizer.zero_grad()
+        scheduler.step(epoch, opt_step)
+        opt_step += 1
 
     n = max(steps, 1)
     return {"ce_loss": total_ce / n, "steps": steps}
@@ -401,18 +451,18 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage-1 adapter training: CovoAudioForCausalLM")
     p.add_argument("--model_name_or_path", default=None)
     p.add_argument("--output_dir",         required=True)
-    p.add_argument("--num_epochs",         type=int,   default=10)
-    p.add_argument("--steps_per_epoch",    type=int,   default=20000,
+    p.add_argument("--num_epochs",         type=int,   default=5)
+    p.add_argument("--steps_per_epoch",    type=int,   default=60000,
                    help="Estimated optimizer steps per epoch — REQUIRED for correct "
                         "continuous LR interpolation with a streamed dataset, since "
                         "streamed IterableDatasets don't expose __len__. Set this to "
                         "roughly (total_hours * 3600 / avg_clip_seconds / batch_size).")
-    p.add_argument("--batch_size",         type=int,   default=4)
-    p.add_argument("--grad_accum",         type=int,   default=4)
-    p.add_argument("--lr",                 type=float, default=2e-4)
+    p.add_argument("--batch_size",         type=int,   default=2)
+    p.add_argument("--grad_accum",         type=int,   default=16)
+    p.add_argument("--lr",                 type=float, default=1e-3)
     p.add_argument("--weight_decay",       type=float, default=0.01)
     p.add_argument("--max_grad_norm",      type=float, default=1.0)
-    p.add_argument("--warmup_frac",        type=float, default=0.5,
+    p.add_argument("--warmup_frac",        type=float, default=0.4,
                    help="Fraction of epochs spanned by warmup (default 0.5 = 50%%).")
     p.add_argument("--lr_min_frac",        type=float, default=0.01,
                    help="LR floor as fraction of peak (default 0.01 = 1%%).")
@@ -488,6 +538,13 @@ def main():
         
         
         model = CovoAudioForCausalLM(covo_config)
+
+        ctc_vocab_size = tokenizer.vocab_size + 1   
+        blank_idx = tokenizer.vocab_size
+        
+    
+        ctc_head = nn.Linear(1536, ctc_vocab_size)
+        model.ctc_head = ctc_head
     
 
         model.llm.load_state_dict(base_llm.state_dict(), strict=False)
@@ -500,9 +557,10 @@ def main():
         model = CovoAudioForCausalLM(CovoAudioConfig(audio_token_index=audio_token_index))
     
     model = model.to(device=device, dtype=dtype)
+    model.ctc_head = model.ctc_head.to(device=device, dtype=dtype)
     # ── Freeze: only audio_adapter is trainable ───────────────────────────────
     for name, param in model.named_parameters():
-        param.requires_grad = name.startswith("audio_adapter.")
+        param.requires_grad = name.startswith("audio_adapter.") or name.startswith("ctc_head")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_p   = sum(p.numel() for p in model.parameters())
@@ -533,10 +591,19 @@ def main():
                               collate_fn=collator, num_workers=2, pin_memory=True, shuffle=False)
 
     # ── Optimizer + scheduler ─────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95), eps=1e-8,
-    )
+    adapter_params = []
+    ctc_head_params = []
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            if n.startswith("ctc_head."):
+                ctc_head_params.append(p)
+            elif n.startswith("audio_adapter."):
+                adapter_params.append(p)
+    
+    optimizer = torch.optim.AdamW([
+        {"params": adapter_params,   "lr": args.lr},          
+        {"params": ctc_head_params,  "lr": args.lr * 4.0},     
+    ], weight_decay=args.weight_decay, betas=(0.9, 0.95), eps=1e-8)
     scheduler = EpochWarmupCosineScheduler(
         optimizer=optimizer,
         num_epochs=args.num_epochs,
@@ -563,6 +630,7 @@ def main():
             scheduler=scheduler, device=device, epoch=epoch,
             num_epochs=args.num_epochs, grad_accum=args.grad_accum,
             audio_token_index=audio_token_index, tokenizer=tokenizer,
+            blank_idx=blank_idx,
             max_grad_norm=args.max_grad_norm,
             log_every=args.log_every, diag_every=args.diag_every,
             steps_per_epoch_hint=args.steps_per_epoch,
