@@ -576,7 +576,7 @@ def main():
 
     train_ds = LibriSpeechStreamingDataset(
         tokenizer=tokenizer, audio_token_index=audio_token_index,
-        use_extra_data=args.extra_data, seed=args.seed,
+        seed=args.seed,
         adapter_downsample=adapter_downsample,
     )
     val_ds = LibriSpeechValDataset(
